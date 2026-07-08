@@ -22,5 +22,5 @@
 
 ## Special Thanks to:
 - Tovarichtch, DiscoStarSlayer, Uyjulian, krHACKen, and many more for all your help
-- Berion for the new app icon
+- Berion for the new app icon 
 
