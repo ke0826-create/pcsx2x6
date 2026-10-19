@@ -29,27 +29,26 @@
 // Trigger: hotkey "RollbackSelfTest" (default F10) while a game is running, ideally in the
 // middle of a CPU battle with nobody touching the pad.
 //
-// 1. Snapshot benchmark: saves/loads an in-memory snapshot (SaveState_FastSave/FastLoad) 20 times
-//    and logs the average time plus the per-phase breakdown. The normal (zip) save/load path is
-//    profiled too ("SaveStateProfile:" lines) during the first configuration.
-// 2. A small matrix of configurations (snapshot backend x scripted input x re-simulation speed).
+// 1. Measures which EE RAM the in-memory snapshot has to cover (the first 32 MB plus every non-zero
+//    64 KB block above it) and benchmarks the snapshot: saves, and loads in the three modes
+//    (full / keep-JIT / diff), with the per-phase breakdown of the last iteration.
+// 2. A small matrix of configurations (restore mode x scripted input x re-simulation speed).
 //    For each configuration:
 //
 //   frame boundary k   : request "leave the CPU loop"; right after the loop is left (a clean point,
 //                        no event handler in flight) take a snapshot, n = 0
 //   frames n = 1..N    : (optional) scripted JVS input as a pure function of n; normal speed
-//   n == N             : copy EE RAM -> reference
+//   n == N             : copy ALL EE RAM -> reference
 //   restore            : request "leave the CPU loop"; at the clean point restore the snapshot, n = 0
 //   frames n = 1..N    : the SAME scripted input; normal or unlimited speed
-//   n == N             : copy EE RAM, compare with the reference and with the first re-simulation
+//   n == N             : copy ALL EE RAM, compare with the reference and with the first re-simulation
 //   repeat the restore/re-simulate/compare kRepeats times
 //
-// A hash of the first 32 MB of EE RAM is taken at every frame boundary, so a mismatch is reported
-// together with the first frame index at which the runs diverge (0 = right after the load).
-// The time of the first re-simulated frames is logged too, to show what throwing away the
-// recompiler caches on every restore costs.
+// The comparison covers the whole EE RAM, so a region the snapshot does not cover but the game writes
+// shows up as a difference. A hash of the first 32 MB is taken at every frame boundary to report the
+// first frame at which two runs diverge (0 = right after the restore).
 //
-// The log (emulog.txt / console) gets lines starting with "RollbackTest:".
+// The log (emulog.txt / console) gets lines starting with "RollbackTest:" and "SaveStateProfile:".
 //  * Rendering is NOT skipped during the re-simulation; the measured speed is therefore a
 //    conservative number for "how fast can we re-simulate".
 //  * Saving/loading only at the clean point matters: 1447cc1/fa60cbb saved and loaded from inside the
@@ -76,35 +75,30 @@ namespace Rollback
 			Load,
 		};
 
-		enum class Backend
-		{
-			Zip,         // the normal save state file (zip, GS, screenshot)
-			Fast,        // in-memory snapshot, recompiler caches cleared on restore
-			FastKeepJit, // in-memory snapshot, recompiler caches kept (code in RAM is static in battle)
-		};
-
 		struct Cfg
 		{
 			bool input;     // drive the JVS buttons from the script
 			bool unlimited; // re-simulate with the limiter off
-			Backend backend;
+			FastLoadMode mode;
 			const char* name;
 		};
 
-		// The riskiest variant (keeping the JIT caches) is last so that a crash there loses nothing else.
+		// The "full" configuration is the control (what the first version did): it is last.
 		constexpr Cfg kMatrix[] = {
-			{true, true, Backend::Zip, "zip/input/unlimited"},
-			{true, true, Backend::Fast, "fast/input/unlimited"},
-			{false, false, Backend::Fast, "fast/no-input/normal-speed"},
-			{true, true, Backend::FastKeepJit, "fast-keepjit/input/unlimited"},
+			{true, true, FastLoadMode::Diff, "diff/input/unlimited"},
+			{false, false, FastLoadMode::Diff, "diff/no-input/normal-speed"},
+			{true, true, FastLoadMode::Full, "full/input/unlimited"},
 		};
 
 		constexpr u32 kFrames = 120; // frames per pass (N)
 		constexpr u32 kRepeats = 3;  // restore + re-simulate passes per configuration
 		constexpr u32 kHashBytes = 32u * 1024u * 1024u; // per-frame hash covers the first 32 MB
-		constexpr u32 kMinSnapshotBytes = 32u * 1024u * 1024u;
-		constexpr u32 kBenchIterations = 20;
-		constexpr u32 kFirstFrames = 5; // number of frames after a restore whose time is logged
+		constexpr u32 kBaseRegionBytes = 32u * 1024u * 1024u;
+		constexpr u32 kBlockBytes = 64u * 1024u; // granularity of the "non-zero above 32 MB" scan
+		constexpr u32 kBenchSaves = 20;
+		constexpr u32 kBenchDiffLoads = 20;
+		constexpr u32 kBenchSlowLoads = 3; // full / keep-JIT loads are slow, a few are enough
+		constexpr u32 kFirstFrames = 5;    // number of frames after a restore whose time is logged
 
 		// 64-byte line holding the USB I/O board status counter (".;RAYS PCB;"), measured to differ
 		// between a straight run and a restored run without affecting the game logic (2026-10-19).
@@ -125,9 +119,8 @@ namespace Rollback
 		u32 s_fail = 0;
 		u16 s_mask = 0; // script bits currently pressed
 		LimiterModeType s_prev_limiter = LimiterModeType::Nominal;
-		std::string s_state_path;
 		FastSnapshot s_snap;
-		u32 s_snapshot_bytes = kMinSnapshotBytes; // EE RAM covered by the in-memory snapshot
+		std::vector<FastRegion> s_regions; // EE RAM covered by the snapshot
 		std::vector<u8> s_ref;
 		std::vector<u8> s_cur;
 		std::vector<u8> s_first; // first re-simulation of the current configuration
@@ -140,6 +133,7 @@ namespace Rollback
 		double s_ms_load = 0.0;
 		double s_ms_save = 0.0;
 		double s_ms_ref = 0.0;
+		u32 s_pages_restored = 0;
 
 		u32 RamSize()
 		{
@@ -318,8 +312,6 @@ namespace Rollback
 			s_hash_ms = 0.0;
 			VMManager::SetLimiterMode(s_prev_limiter);
 			ApplyMask(0);
-			// The normal (zip) path gets a phase breakdown, once, in its configuration.
-			g_SaveStateProfile = (kMatrix[s_cfg].backend == Backend::Zip);
 		}
 
 		void BeginConfig()
@@ -340,31 +332,15 @@ namespace Rollback
 		// Runs at the clean point after the CPU loop was left.
 		void DoSave()
 		{
-			bool save_ok = true;
+			Error error;
 			Common::Timer timer;
-			if (kMatrix[s_cfg].backend == Backend::Zip)
+			if (!SaveState_FastSave(s_snap, true, &error))
 			{
-				VMManager::SaveState(s_state_path.c_str(), false, false,
-					[&save_ok](const std::string& message) {
-						save_ok = false;
-						Console.Error("RollbackTest: SaveState failed: %s", message.c_str());
-					});
-			}
-			else
-			{
-				Error error;
-				if (!SaveState_FastSave(s_snap, s_snapshot_bytes, true, &error))
-				{
-					save_ok = false;
-					Console.Error("RollbackTest: SaveState_FastSave failed: %s", error.GetDescription().c_str());
-				}
-			}
-			s_ms_save = timer.GetTimeMilliseconds();
-			if (!save_ok)
-			{
+				Console.Error("RollbackTest: SaveState_FastSave failed: %s", error.GetDescription().c_str());
 				EndTest("save failed");
 				return;
 			}
+			s_ms_save = timer.GetTimeMilliseconds();
 
 			s_hash_ms = 0.0;
 			RecordHash(s_hash_ref, 0);
@@ -381,20 +357,7 @@ namespace Rollback
 		{
 			Error error;
 			Common::Timer timer;
-			bool load_ok = true;
-			switch (kMatrix[s_cfg].backend)
-			{
-				case Backend::Zip:
-					load_ok = VMManager::LoadState(s_state_path.c_str(), &error);
-					break;
-				case Backend::Fast:
-					load_ok = SaveState_FastLoad(s_snap, false, s_repeat == 0, &error);
-					break;
-				case Backend::FastKeepJit:
-					load_ok = SaveState_FastLoad(s_snap, true, s_repeat == 0, &error);
-					break;
-			}
-			if (!load_ok)
+			if (!SaveState_FastLoad(s_snap, kMatrix[s_cfg].mode, s_repeat == 0, &s_pages_restored, &error))
 			{
 				Console.Error("RollbackTest: restore failed: %s", error.GetDescription().c_str());
 				EndTest("load failed");
@@ -415,16 +378,20 @@ namespace Rollback
 			s_timer.Reset();
 		}
 
-		// Highest non-zero 4 KB page of EE RAM decides how much the in-memory snapshot has to cover.
+		// The snapshot covers the first 32 MB plus every non-zero 64 KB block above it (coalesced).
 		void MeasureRamUse()
 		{
 			const u32 ram = RamSize();
-			u32 top = 0;
-			for (u32 end = ram; end >= 4096; end -= 4096)
+			const u32 base_end = std::min<u32>(kBaseRegionBytes, ram);
+			s_regions.clear();
+			s_regions.push_back({0, base_end});
+
+			u32 extra_blocks = 0;
+			for (u32 off = base_end; off + kBlockBytes <= ram; off += kBlockBytes)
 			{
-				const u64* w = reinterpret_cast<const u64*>(eeMem->Main + end - 4096);
+				const u64* w = reinterpret_cast<const u64*>(eeMem->Main + off);
 				bool nonzero = false;
-				for (u32 i = 0; i < 512; i++)
+				for (u32 i = 0; i < kBlockBytes / 8; i++)
 				{
 					if (w[i])
 					{
@@ -432,16 +399,25 @@ namespace Rollback
 						break;
 					}
 				}
-				if (nonzero)
-				{
-					top = end;
-					break;
-				}
+				if (!nonzero)
+					continue;
+
+				extra_blocks++;
+				FastRegion& last = s_regions.back();
+				if (last.offset + last.size == off)
+					last.size += kBlockBytes;
+				else
+					s_regions.push_back({off, kBlockBytes});
 			}
-			const u32 mb = 1024u * 1024u;
-			s_snapshot_bytes = std::max<u32>(kMinSnapshotBytes, (top + mb - 1) / mb * mb);
-			Console.WriteLn("RollbackTest: EE RAM: %u MB exposed, last non-zero byte below 0x%X; the in-memory snapshot covers %u MB",
-				ram >> 20, top, s_snapshot_bytes >> 20);
+
+			u32 total = 0;
+			for (const FastRegion& r : s_regions)
+				total += r.size;
+			Console.WriteLn("RollbackTest: EE RAM %u MB exposed: base %u MB + %u non-zero 64 KB blocks above it in %u regions; snapshot covers %u KB",
+				ram >> 20, base_end >> 20, extra_blocks, static_cast<u32>(s_regions.size()), total >> 10);
+			const size_t shown = std::min<size_t>(s_regions.size(), 10);
+			for (size_t i = 0; i < shown; i++)
+				Console.WriteLn("RollbackTest:   region %u: 0x%07X + %u KB", static_cast<u32>(i), s_regions[i].offset, s_regions[i].size >> 10);
 		}
 
 		// Times the in-memory snapshot on its own (no frames run in between; the state does not change).
@@ -450,40 +426,57 @@ namespace Rollback
 			MeasureRamUse();
 
 			FastSnapshot snap;
+			snap.ee_regions = s_regions;
 			Error error;
 			Common::Timer timer;
-			if (!SaveState_FastSave(snap, s_snapshot_bytes, true, &error)) // first call: allocation + page faults
+			if (!SaveState_FastSave(snap, true, &error)) // first call: allocation + page faults
 			{
 				Console.Error("RollbackTest: bench: first save failed: %s", error.GetDescription().c_str());
 				return;
 			}
 			const double first_ms = timer.GetTimeMillisecondsAndReset();
 
-			for (u32 i = 0; i < kBenchIterations; i++)
+			for (u32 i = 0; i < kBenchSaves; i++)
 			{
-				if (!SaveState_FastSave(snap, s_snapshot_bytes, i + 1 == kBenchIterations, &error))
+				if (!SaveState_FastSave(snap, i + 1 == kBenchSaves, &error))
 				{
 					Console.Error("RollbackTest: bench: save failed: %s", error.GetDescription().c_str());
 					return;
 				}
 			}
-			const double save_ms = timer.GetTimeMillisecondsAndReset() / kBenchIterations;
+			const double save_ms = timer.GetTimeMillisecondsAndReset() / kBenchSaves;
 
-			for (u32 i = 0; i < kBenchIterations; i++)
-			{
-				if (!SaveState_FastLoad(snap, false, i + 1 == kBenchIterations, &error))
-				{
-					Console.Error("RollbackTest: bench: load failed: %s", error.GetDescription().c_str());
-					return;
-				}
-			}
-			const double load_ms = timer.GetTimeMilliseconds() / kBenchIterations;
-
-			Console.WriteLn("RollbackTest: bench: in-memory snapshot %u KB (internals %u KB, EE RAM %u KB, other %u KB): "
-							"first save %.2f ms, save avg %.2f ms, load avg %.2f ms (JIT caches cleared on every load)",
+			Console.WriteLn("RollbackTest: bench: in-memory snapshot %u KB (internals %u KB, EE RAM %u KB, other %u KB): first save %.2f ms, save avg %.2f ms",
 				static_cast<u32>((snap.internals.size() + snap.ee.size() + snap.other.size()) >> 10),
 				static_cast<u32>(snap.internals.size() >> 10), static_cast<u32>(snap.ee.size() >> 10),
-				static_cast<u32>(snap.other.size() >> 10), first_ms, save_ms, load_ms);
+				static_cast<u32>(snap.other.size() >> 10), first_ms, save_ms);
+
+			struct Item
+			{
+				FastLoadMode mode;
+				u32 iterations;
+				const char* name;
+			};
+			const Item items[] = {
+				{FastLoadMode::Diff, kBenchDiffLoads, "diff (no ResetBlockTracking, JIT kept)"},
+				{FastLoadMode::KeepJit, kBenchSlowLoads, "keep-JIT (ResetBlockTracking, JIT kept)"},
+				{FastLoadMode::Full, kBenchSlowLoads, "full (ResetBlockTracking + JIT cleared)"},
+			};
+			for (const Item& it : items)
+			{
+				u32 pages = 0;
+				timer.Reset();
+				for (u32 i = 0; i < it.iterations; i++)
+				{
+					if (!SaveState_FastLoad(snap, it.mode, i + 1 == it.iterations, &pages, &error))
+					{
+						Console.Error("RollbackTest: bench: load failed: %s", error.GetDescription().c_str());
+						return;
+					}
+				}
+				Console.WriteLn("RollbackTest: bench: load %s: avg %.2f ms over %u loads (pages written in the last one: %u)",
+					it.name, timer.GetTimeMilliseconds() / it.iterations, it.iterations, pages);
+			}
 		}
 
 		void BeginTest()
@@ -493,12 +486,11 @@ namespace Rollback
 			s_pass = 0;
 			s_fail = 0;
 			s_prev_limiter = VMManager::GetLimiterMode();
-			s_state_path = Path::Combine(EmuFolders::Savestates, "rollback_selftest.p2s");
 			s_snap = FastSnapshot();
-			s_snapshot_bytes = kMinSnapshotBytes;
+			g_SaveStateProfile = false;
 
-			Console.WriteLn("RollbackTest: begin. frames=%u repeats=%u configs=%u ram=%u MB state=%s",
-				kFrames, kRepeats, static_cast<u32>(std::size(kMatrix)), RamSize() >> 20, s_state_path.c_str());
+			Console.WriteLn("RollbackTest: begin. frames=%u repeats=%u configs=%u ram=%u MB",
+				kFrames, kRepeats, static_cast<u32>(std::size(kMatrix)), RamSize() >> 20);
 			// The benchmark and the first snapshot are taken at the clean point after the CPU loop exits.
 			RequestAction(Pending::Bench, Phase::WaitBench);
 		}
@@ -506,10 +498,10 @@ namespace Rollback
 		void ReportResim(double resim_total_ms)
 		{
 			const double net_ms = resim_total_ms - s_hash_ms;
-			Console.WriteLn("RollbackTest: [%u/%u] '%s' resim %u/%u: restore=%.2f ms, %u frames in %.1f ms (excluding hashing) = %.0f frames/s; "
+			Console.WriteLn("RollbackTest: [%u/%u] '%s' resim %u/%u: restore=%.2f ms (pages written %u), %u frames in %.1f ms (excluding hashing) = %.0f frames/s; "
 							"reference pass %.1f ms",
 				s_cfg + 1, static_cast<u32>(std::size(kMatrix)), kMatrix[s_cfg].name, s_repeat + 1, kRepeats,
-				s_ms_load, kFrames, net_ms, (net_ms > 0.0) ? (kFrames * 1000.0 / net_ms) : 0.0, s_ms_ref);
+				s_ms_load, s_pages_restored, kFrames, net_ms, (net_ms > 0.0) ? (kFrames * 1000.0 / net_ms) : 0.0, s_ms_ref);
 			Console.WriteLn("RollbackTest:   first re-simulated frames, cumulative ms: %.1f %.1f %.1f %.1f %.1f",
 				s_first_frame_ms[1], s_first_frame_ms[2], s_first_frame_ms[3], s_first_frame_ms[4], s_first_frame_ms[5]);
 
@@ -614,6 +606,7 @@ namespace Rollback
 			case Pending::Bench:
 				RunBench();
 				// We are already at the clean point: take the first snapshot right here.
+				s_snap.ee_regions = s_regions;
 				PrepareConfig();
 				DoSave();
 				break;

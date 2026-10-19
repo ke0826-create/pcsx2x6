@@ -71,7 +71,17 @@ namespace
 				Console.WriteLn("SaveStateProfile: %s %-26s %.2f ms", prefix, what, ms);
 		}
 	};
+
+	// Set by the fast snapshot functions while they run FreezeInternals(), to time its parts.
+	ProfLap* s_freeze_prof = nullptr;
 } // namespace
+
+#define FREEZE_LAP(name) \
+	do \
+	{ \
+		if (s_freeze_prof) \
+			s_freeze_prof->Lap(name); \
+	} while (0)
 
 static void PreLoadPrep()
 {
@@ -216,6 +226,7 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	Freeze(cachedTlbs);		// cached tlbs
 	Freeze(AllowParams1);	//OSDConfig written (Fast Boot)
 	Freeze(AllowParams2);
+	FREEZE_LAP("  vmFreeze+cpuRegs+tlb");
 
 	// Third Block - Cycle Timers and Events
 	// -------------------------------------
@@ -235,19 +246,27 @@ bool SaveStateBase::FreezeInternals(Error* error)
 		return false;
 
 	bool okay = rcntFreeze();
+	FREEZE_LAP("  rcntFreeze");
 	okay = okay && memFreeze(error);
 	okay = okay && gsFreeze();
+	FREEZE_LAP("  memFreeze+gsFreeze");
 	okay = okay && vuMicroFreeze();
+	FREEZE_LAP("  vuMicroFreeze");
 	okay = okay && vuJITFreeze();
+	FREEZE_LAP("  vuJITFreeze");
 	okay = okay && vif0Freeze();
 	okay = okay && vif1Freeze();
+	FREEZE_LAP("  vif0/vif1Freeze");
 	okay = okay && sifFreeze();
 	okay = okay && ipuFreeze();
 	okay = okay && ipuDmaFreeze();
+	FREEZE_LAP("  sif+ipuFreeze");
 	okay = okay && gifFreeze();
 	okay = okay && gifDmaFreeze();
+	FREEZE_LAP("  gifFreeze");
 	okay = okay && sprFreeze();
 	okay = okay && mtvuFreeze();
+	FREEZE_LAP("  spr+mtvuFreeze");
 	if (!okay)
 		return false;
 
@@ -298,8 +317,11 @@ bool SaveStateBase::FreezeInternals(Error* error)
 		}
 	}
 
+	FREEZE_LAP("  iop sif+rcnt+sio");
 	okay = okay && cdrFreeze();
+	FREEZE_LAP("  cdrFreeze");
 	okay = okay && cdvdFreeze();
+	FREEZE_LAP("  cdvdFreeze");
 
 	// technically this is HLE BIOS territory, but we don't have enough such stuff
 	// to merit an HLE Bios sub-section... yet.
@@ -308,6 +330,7 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	okay = okay && InputRecordingFreeze();
 
 	okay = okay && handleFreeze(); //file handles
+	FREEZE_LAP("  deci2+handles");
 
 	return okay;
 }
@@ -1309,22 +1332,54 @@ static void FastFreezeBlocks(SaveStateBase& state, ProfLap& prof)
 	prof.Lap("HW regs + VU memories");
 }
 
-bool SaveState_FastSave(FastSnapshot& snap, u32 ee_bytes, bool log, Error* error)
+// The EE RAM regions of a snapshot, clamped to the exposed RAM. Empty = the first 32 MB.
+static std::vector<FastRegion> FastEffectiveRegions(const FastSnapshot& snap)
+{
+	std::vector<FastRegion> out;
+	const u32 limit = Ps2MemSize::ExposedRam;
+	if (snap.ee_regions.empty())
+	{
+		out.push_back({0, std::min<u32>(32u * 1024u * 1024u, limit)});
+		return out;
+	}
+	for (const FastRegion& r : snap.ee_regions)
+	{
+		if (r.offset >= limit)
+			continue;
+		out.push_back({r.offset, std::min<u32>(r.size, limit - r.offset)});
+	}
+	return out;
+}
+
+bool SaveState_FastSave(FastSnapshot& snap, bool log, Error* error)
 {
 	ProfLap prof("fast-save", log);
-	ee_bytes = std::min<u32>(ee_bytes, Ps2MemSize::ExposedRam);
 
 	// The vectors are NOT cleared: memSavingState only grows a buffer when it has to, so a buffer that
 	// already has the right size is overwritten in place without being zero-filled first.
+	s_freeze_prof = log ? &prof : nullptr;
 	{
 		memSavingState saveme(snap.internals);
 		if (!saveme.FreezeBios() || !saveme.FreezeInternals(error))
+		{
+			s_freeze_prof = nullptr;
 			return false;
+		}
 	}
+	s_freeze_prof = nullptr;
 	prof.Lap("FreezeBios+Internals");
 
-	snap.ee.resize(ee_bytes);
-	std::memcpy(snap.ee.data(), eeMem->Main, ee_bytes);
+	const std::vector<FastRegion> regions = FastEffectiveRegions(snap);
+	size_t total = 0;
+	for (const FastRegion& r : regions)
+		total += r.size;
+	snap.ee.resize(total);
+	size_t pos = 0;
+	for (const FastRegion& r : regions)
+	{
+		std::memcpy(snap.ee.data() + pos, eeMem->Main + r.offset, r.size);
+		pos += r.size;
+	}
 	prof.Lap("EE RAM copy");
 
 	{
@@ -1337,33 +1392,67 @@ bool SaveState_FastSave(FastSnapshot& snap, u32 ee_bytes, bool log, Error* error
 	return true;
 }
 
-bool SaveState_FastLoad(const FastSnapshot& snap, bool keep_jit, bool log, Error* error)
+bool SaveState_FastLoad(const FastSnapshot& snap, FastLoadMode mode, bool log, u32* pages_restored, Error* error)
 {
 	ProfLap prof("fast-load", log);
+	if (pages_restored)
+		*pages_restored = 0;
 
-	// Same preparation as PreLoadPrep(), optionally keeping the recompiler caches.
+	// Same preparation as PreLoadPrep(), minus the parts the chosen mode skips.
 	if (THREAD_VU1)
 		vu1Thread.WaitVU();
 	MTGS::WaitGS(false);
 	prof.Lap("WaitVU+WaitGS");
 
 	std::memcpy(s_tlb_backup, tlb, sizeof(s_tlb_backup));
-	mmap_ResetBlockTracking();
+	if (mode != FastLoadMode::Diff)
+		mmap_ResetBlockTracking();
 	prof.Lap("tlb backup+ResetBlockTracking");
 
-	if (!keep_jit)
+	if (mode == FastLoadMode::Full)
 		VMManager::Internal::ClearCPUExecutionCaches();
 	prof.Lap("ClearCPUExecutionCaches");
 
+	s_freeze_prof = log ? &prof : nullptr;
 	{
 		memLoadingState state(snap.internals);
 		if (!state.FreezeBios() || !state.FreezeInternals(error))
+		{
+			s_freeze_prof = nullptr;
 			return false;
+		}
 	}
+	s_freeze_prof = nullptr;
 	prof.Lap("FreezeBios+Internals");
 
-	std::memcpy(eeMem->Main, snap.ee.data(), snap.ee.size());
-	prof.Lap("EE RAM copy");
+	const std::vector<FastRegion> regions = FastEffectiveRegions(snap);
+	size_t pos = 0;
+	u32 restored = 0;
+	for (const FastRegion& r : regions)
+	{
+		u8* dst = eeMem->Main + r.offset;
+		const u8* src = snap.ee.data() + pos;
+		if (mode == FastLoadMode::Diff)
+		{
+			for (u32 o = 0; o < r.size; o += 4096)
+			{
+				const u32 n = std::min<u32>(4096, r.size - o);
+				if (std::memcmp(dst + o, src + o, n) != 0)
+				{
+					std::memcpy(dst + o, src + o, n);
+					restored++;
+				}
+			}
+		}
+		else
+		{
+			std::memcpy(dst, src, r.size);
+		}
+		pos += r.size;
+	}
+	if (pages_restored)
+		*pages_restored = restored;
+	prof.Lap("EE RAM restore");
 
 	{
 		memLoadingState state(snap.other);

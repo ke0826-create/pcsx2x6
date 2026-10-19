@@ -64,19 +64,34 @@ extern bool g_SaveStateProfile;
 
 // Rollback: an in-memory snapshot. Same contents as a normal save state except: no zip/compression,
 // no screenshot, no GS (VRAM and registers stay as they are; the game re-sends GS state every frame),
-// no USB/PAD/achievements, and only the first ee_bytes of EE RAM. Keep the object between calls: the
-// buffers keep their capacity, so after the first call a save does not allocate.
+// no USB/PAD/achievements, and only the EE RAM regions listed in ee_regions. Keep the object between
+// calls: the buffers keep their capacity, so after the first call a save does not allocate.
+struct FastRegion
+{
+	u32 offset; // EE RAM offset, multiple of 4096
+	u32 size;   // bytes, multiple of 4096
+};
+
 struct FastSnapshot
 {
-	std::vector<u8> internals; // BIOS tag + FreezeInternals (memSavingState format)
-	std::vector<u8> ee;        // EE RAM [0, ee.size())
-	std::vector<u8> other;     // IOP RAM, HW registers, scratchpad, VU memories, SPU2 (fixed order)
+	std::vector<u8> internals;          // BIOS tag + FreezeInternals (memSavingState format)
+	std::vector<FastRegion> ee_regions; // set by the caller; empty = the first 32 MB
+	std::vector<u8> ee;                 // the regions' bytes, back to back
+	std::vector<u8> other;              // IOP RAM, HW registers, scratchpad, VU memories, SPU2 (fixed order)
+};
+
+enum class FastLoadMode
+{
+	Full,    // like a normal load: ResetBlockTracking + throw away the recompiler caches, copy everything
+	KeepJit, // ResetBlockTracking but keep the recompiler caches, copy everything
+	Diff,    // neither: copy only the 4 KB pages that differ. A write into a page that holds recompiled
+	         // code goes through the page fault handler, which invalidates the blocks of that page.
 };
 
 // log = print the per-phase timings of this call.
-extern bool SaveState_FastSave(FastSnapshot& snap, u32 ee_bytes, bool log, Error* error);
-// keep_jit = do not throw away the recompiler caches (only valid while the code in RAM is unchanged).
-extern bool SaveState_FastLoad(const FastSnapshot& snap, bool keep_jit, bool log, Error* error);
+extern bool SaveState_FastSave(FastSnapshot& snap, bool log, Error* error);
+// pages_restored (optional) = number of 4 KB EE RAM pages that were written (Diff mode only).
+extern bool SaveState_FastLoad(const FastSnapshot& snap, FastLoadMode mode, bool log, u32* pages_restored, Error* error);
 extern bool SaveState_UnzipFromDisk(const std::string& filename, Error* error);
 
 // --------------------------------------------------------------------------------------
