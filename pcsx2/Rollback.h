@@ -23,6 +23,9 @@ namespace Rollback
 	/// Arms the self-test; it starts at the next frame boundary. Ignored while a test is running.
 	void RequestSelfTest();
 
+	/// Arms the late-input rollback session test (F11); it starts at the next frame boundary.
+	void RequestSessionTest();
+
 	/// True while a self-test is in progress.
 	bool IsSelfTestRunning();
 } // namespace Rollback

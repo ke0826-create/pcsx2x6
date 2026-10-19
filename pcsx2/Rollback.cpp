@@ -522,24 +522,478 @@ namespace Rollback
 				LogCompare("vs first re-simulation", s_first, s_cur, FirstDivergence(s_hash_first, s_hash_cur));
 			}
 		}
+		// ======================================================================================
+		// Rollback session test (late inputs)
+		// ======================================================================================
+		// Models what netplay needs, in one emulator: the input of every frame is KNOWN only some frames
+		// later ("delivered"); until then the loop runs with a PREDICTED input (hold the last known one).
+		// When a delivered input differs from what was used, the loop restores the newest snapshot at or
+		// before that frame and re-simulates up to the present with the corrected inputs.
+		//
+		//   ground truth : S0 -> kN frames with the true inputs on time -> EE RAM
+		//   session      : S0 -> kN frames with late inputs + rollbacks   -> EE RAM   (must be identical)
+		//
+		// Snapshots are taken every kK frames into a ring (a snapshot is valid until a misprediction at an
+		// earlier frame is found; then it is dropped). Hook n applies the input of "frame n"; the snapshot of
+		// frame n is taken at the clean point right after hook n (start of frame n, input n applied).
+		// The clean point rule is the same as in the other test: only OnExecutionExit() saves or loads.
+		namespace sess
+		{
+			constexpr u32 kN = 360;   // frames per run
+			constexpr u32 kK = 4;     // snapshot interval
+			constexpr u32 kRing = 5;  // snapshots kept (covers about kK * kRing frames)
+			constexpr u32 kNone = 0xFFFFFFFFu;
+
+			enum class Pat
+			{
+				Fixed,  // every input is delivered `param` frames late
+				Jitter, // 0..param frames late, different per frame (out of order delivery)
+				Burst,  // on time, except frames 40..53 of every 60 are all delivered at frame 54
+			};
+
+			struct Pattern
+			{
+				Pat kind;
+				u32 param;
+				const char* name;
+			};
+
+			constexpr Pattern kPatterns[] = {
+				{Pat::Fixed, 3, "fixed delay 3"},
+				{Pat::Fixed, 8, "fixed delay 8"},
+				{Pat::Jitter, 10, "jitter 0-10"},
+				{Pat::Burst, 14, "bursts (up to 14 late)"},
+			};
+
+			enum class Step
+			{
+				Idle,
+				Gt,  // ground-truth run
+				Run, // session run (live or re-simulating)
+			};
+
+			enum class Act
+			{
+				None,
+				Init,     // take S0
+				Restore0, // restore S0 and start the next pattern
+				Save,     // take a ring snapshot
+				Rollback, // restore a ring snapshot
+			};
+
+			struct Slot
+			{
+				FastSnapshot snap;
+				u32 frame = 0;
+				bool valid = false;
+			};
+
+			bool requested = false;
+			Step step = Step::Idle;
+			Act act = Act::None;
+			u32 pat = 0;
+			u32 n = 0;      // current hook index
+			u32 target = 0; // hook index to reach again after a rollback
+			bool resim = false;
+			u32 save_slot = 0;
+			u32 save_frame = 0;
+			u32 roll_slot = 0;
+			FastSnapshot s0;
+			Slot ring[kRing];
+			std::vector<u8> gt_ram;
+			std::vector<u8> rb_ram;
+			u16 truth[kN + 1] = {};
+			bool delivered[kN + 1] = {};
+			u32 deliver_at[kN + 1] = {};
+			u16 used[kN + 1] = {};
+			// statistics of the current pattern
+			u32 rollbacks = 0, resim_frames = 0, max_depth = 0, saves = 0, pred_ok = 0, pred_bad = 0;
+			double ms_restore = 0.0, ms_save = 0.0, gt_ms = 0.0;
+			Common::Timer wall;
+
+			u16 HashMask(u32 f)
+			{
+				const u32 h = (f / 6 + 1) * 2654435761u;
+				u16 mask = 0;
+				for (u32 i = 0; i < static_cast<u32>(std::size(kScriptBits)); i++)
+				{
+					if ((h >> (i * 3 + 5)) & 1u)
+						mask |= kScriptBits[i];
+				}
+				return mask;
+			}
+
+			u32 Delay(const Pattern& p, u32 f)
+			{
+				switch (p.kind)
+				{
+					case Pat::Fixed:
+						return p.param;
+					case Pat::Jitter:
+						return ((f * 2654435761u) >> 7) % (p.param + 1);
+					case Pat::Burst:
+					{
+						const u32 c = f % 60;
+						return (c >= 40 && c < 54) ? (54 - c) : 0;
+					}
+				}
+				return 0;
+			}
+
+			// The input to use for frame f: the true one if it was delivered, else "hold the last known".
+			u16 InputFor(u32 f)
+			{
+				if (delivered[f])
+					return truth[f];
+				for (u32 g = f; g > 0; g--)
+				{
+					if (delivered[g - 1])
+						return truth[g - 1];
+				}
+				return 0;
+			}
+
+			void ApplyUse(u32 f)
+			{
+				used[f] = InputFor(f);
+				ApplyMask(used[f]);
+			}
+
+			bool Active()
+			{
+				return step != Step::Idle || act != Act::None;
+			}
+
+			void Finish(const char* why)
+			{
+				ApplyMask(0);
+				if (VMManager::HasValidVM())
+					VMManager::SetLimiterMode(s_prev_limiter);
+				step = Step::Idle;
+				act = Act::None;
+				requested = false;
+				resim = false;
+				gt_ram.clear();
+				gt_ram.shrink_to_fit();
+				rb_ram.clear();
+				rb_ram.shrink_to_fit();
+				s0 = FastSnapshot();
+				for (Slot& s : ring)
+				{
+					s.snap = FastSnapshot();
+					s.valid = false;
+				}
+				Console.WriteLn("RollbackSession: finished (%s): %u PASS / %u FAIL (session vs ground truth)", why, s_pass, s_fail);
+			}
+
+			void RequestAct(Act a)
+			{
+				act = a;
+				Cpu->ExitExecution();
+			}
+
+			void StartPattern()
+			{
+				RequestAct(Act::Restore0);
+			}
+
+			// Delivers the inputs that are due at network time n (all of them when `all`). Returns the
+			// earliest frame whose used input was wrong, or kNone.
+			u32 Deliver(bool all)
+			{
+				u32 earliest = kNone;
+				const u32 first = (n > 40) ? n - 40 : 0;
+				const u32 last = std::min<u32>(all ? kN - 1 : n, kN - 1);
+				for (u32 f = all ? 0 : first; f <= last; f++)
+				{
+					if (delivered[f] || (!all && deliver_at[f] > n))
+						continue;
+					delivered[f] = true;
+					if (f < n)
+					{
+						if (used[f] != truth[f])
+						{
+							pred_bad++;
+							earliest = std::min(earliest, f);
+						}
+						else
+						{
+							pred_ok++;
+						}
+					}
+				}
+				return earliest;
+			}
+
+			void RequestRollback(u32 mismatch_frame)
+			{
+				int best = -1;
+				for (u32 i = 0; i < kRing; i++)
+				{
+					if (ring[i].valid && ring[i].frame <= mismatch_frame && (best < 0 || ring[i].frame > ring[best].frame))
+						best = static_cast<int>(i);
+				}
+				if (best < 0)
+				{
+					Console.Error("RollbackSession: no snapshot at or before frame %u (hook %u): the window is too short", mismatch_frame, n);
+					Finish("no snapshot");
+					return;
+				}
+				for (u32 i = 0; i < kRing; i++)
+				{
+					if (ring[i].frame > ring[best].frame)
+						ring[i].valid = false;
+				}
+				roll_slot = static_cast<u32>(best);
+				target = n;
+				rollbacks++;
+				const u32 depth = target - ring[best].frame;
+				resim_frames += depth;
+				max_depth = std::max(max_depth, depth);
+				RequestAct(Act::Rollback);
+			}
+
+			void MaybeSave()
+			{
+				if (n > 0 && n % kK == 0)
+				{
+					save_slot = (n / kK) % kRing;
+					save_frame = n;
+					RequestAct(Act::Save);
+				}
+			}
+
+			void ComparePattern()
+			{
+				CopyRam(rb_ram);
+				const DiffResult d = Diff(gt_ram, rb_ram);
+				const double session_ms = wall.GetTimeMilliseconds();
+				if (d.lines == 0)
+					s_pass++;
+				else
+					s_fail++;
+				Console.WriteLn("RollbackSession: [%u/%u] '%s': %s (differing 64B lines=%u, volatile ignored=%u) | predictions right %u / wrong %u | "
+								"rollbacks=%u, frames re-simulated=%u (deepest %u), snapshots taken=%u | %u frames in %.0f ms (ground truth %.0f ms), restores %.1f ms, saves %.1f ms",
+					pat + 1, static_cast<u32>(std::size(kPatterns)), kPatterns[pat].name, (d.lines == 0) ? "MATCH" : "DIFFER", d.lines, d.ignored,
+					pred_ok, pred_bad, rollbacks, resim_frames, max_depth, saves, kN, session_ms, gt_ms, ms_restore, ms_save);
+				if (d.lines != 0)
+					LogCompare("session vs ground truth", gt_ram, rb_ram, -1);
+				pat++;
+				if (pat < static_cast<u32>(std::size(kPatterns)))
+					StartPattern();
+				else
+					Finish("done");
+			}
+
+			void RunHook()
+			{
+				n++;
+				if (resim)
+				{
+					if (n < target)
+					{
+						ApplyUse(n);
+						MaybeSave();
+						return;
+					}
+					resim = false; // back at the hook where the rollback was requested: handle it as a live hook
+				}
+
+				const bool settle = (n >= kN);
+				const u32 m = Deliver(settle);
+				if (m != kNone)
+				{
+					RequestRollback(m);
+					return;
+				}
+				if (settle)
+				{
+					ComparePattern();
+					return;
+				}
+				ApplyUse(n);
+				MaybeSave();
+			}
+
+			void OnHook()
+			{
+				if (act != Act::None)
+					return; // the CPU loop is about to exit
+
+				if (step == Step::Gt)
+				{
+					n++;
+					ApplyMask((n < kN) ? truth[n] : 0);
+					if (n < kN)
+						return;
+					gt_ms = wall.GetTimeMilliseconds();
+					CopyRam(gt_ram);
+					pat = 0;
+					StartPattern();
+					return;
+				}
+				if (step == Step::Run)
+					RunHook();
+			}
+
+			// Runs at the clean point. Returns true when a session action was handled.
+			bool OnExit()
+			{
+				if (act == Act::None)
+					return false;
+
+				const Act a = act;
+				act = Act::None;
+				if (!VMManager::HasValidVM() || VMManager::GetState() != VMState::Running)
+				{
+					Finish("execution interrupted");
+					return true;
+				}
+
+				Error error;
+				Common::Timer t;
+				switch (a)
+				{
+					case Act::Init:
+					{
+						MeasureRamUse();
+						for (u32 f = 0; f <= kN; f++)
+						{
+							truth[f] = (f == 0 || f >= kN) ? 0 : HashMask(f);
+							delivered[f] = false;
+							deliver_at[f] = 0;
+							used[f] = 0;
+						}
+						ApplyMask(0);
+						s0 = FastSnapshot();
+						s0.ee_regions = s_regions;
+						if (!SaveState_FastSave(s0, false, &error))
+						{
+							Console.Error("RollbackSession: S0 save failed: %s", error.GetDescription().c_str());
+							Finish("save failed");
+							return true;
+						}
+						s_prev_limiter = VMManager::GetLimiterMode();
+						VMManager::SetLimiterMode(LimiterModeType::Unlimited);
+						n = 0;
+						step = Step::Gt;
+						wall.Reset();
+						Console.WriteLn("RollbackSession: begin. %u frames per run, snapshot every %u frames (ring %u), %u delay patterns",
+							kN, kK, kRing, static_cast<u32>(std::size(kPatterns)));
+						break;
+					}
+					case Act::Restore0:
+					{
+						if (!SaveState_FastLoad(s0, FastLoadMode::Diff, false, nullptr, &error))
+						{
+							Console.Error("RollbackSession: S0 restore failed: %s", error.GetDescription().c_str());
+							Finish("restore failed");
+							return true;
+						}
+						for (u32 f = 0; f <= kN; f++)
+						{
+							delivered[f] = false;
+							deliver_at[f] = f + Delay(kPatterns[pat], f);
+							used[f] = 0;
+						}
+						for (Slot& s : ring)
+							s.valid = false;
+						ring[0].snap = s0; // frame 0 is the first snapshot
+						ring[0].frame = 0;
+						ring[0].valid = true;
+						rollbacks = resim_frames = max_depth = saves = pred_ok = pred_bad = 0;
+						ms_restore = ms_save = 0.0;
+						n = 0;
+						resim = false;
+						step = Step::Run;
+						ApplyUse(0);
+						wall.Reset();
+						break;
+					}
+					case Act::Save:
+					{
+						Slot& s = ring[save_slot];
+						s.snap.ee_regions = s_regions;
+						if (!SaveState_FastSave(s.snap, false, &error))
+						{
+							Console.Error("RollbackSession: snapshot save failed: %s", error.GetDescription().c_str());
+							Finish("save failed");
+							return true;
+						}
+						s.frame = save_frame;
+						s.valid = true;
+						saves++;
+						ms_save += t.GetTimeMilliseconds();
+						break;
+					}
+					case Act::Rollback:
+					{
+						Slot& s = ring[roll_slot];
+						if (!SaveState_FastLoad(s.snap, FastLoadMode::Diff, false, nullptr, &error))
+						{
+							Console.Error("RollbackSession: restore failed: %s", error.GetDescription().c_str());
+							Finish("restore failed");
+							return true;
+						}
+						ms_restore += t.GetTimeMilliseconds();
+						n = s.frame;
+						resim = true;
+						ApplyUse(n); // start of frame n with its (possibly corrected) input
+						break;
+					}
+					case Act::None:
+						break;
+				}
+				return true;
+			}
+		} // namespace sess
 	} // namespace
 
 	void RequestSelfTest()
 	{
-		if (s_phase == Phase::Idle)
+		if (s_phase == Phase::Idle && !sess::Active())
 		{
 			s_requested = true;
 			Console.WriteLn("RollbackTest: requested; starts at the next frame boundary");
 		}
 	}
 
+	void RequestSessionTest()
+	{
+		if (s_phase == Phase::Idle && !sess::Active())
+		{
+			sess::requested = true;
+			Console.WriteLn("RollbackSession: requested; starts at the next frame boundary");
+		}
+	}
+
 	bool IsSelfTestRunning()
 	{
-		return s_phase != Phase::Idle;
+		return s_phase != Phase::Idle || sess::Active();
 	}
 
 	void OnVSync()
 	{
+		if (sess::Active())
+		{
+			if (!VMManager::HasValidVM())
+				sess::Finish("VM went away");
+			else
+				sess::OnHook();
+			return;
+		}
+		if (s_phase == Phase::Idle && sess::requested)
+		{
+			sess::requested = false;
+			if (VMManager::HasValidVM())
+			{
+				s_pass = 0;
+				s_fail = 0;
+				sess::RequestAct(sess::Act::Init);
+			}
+			return;
+		}
+
 		if (s_phase == Phase::Idle)
 		{
 			if (s_requested)
@@ -590,6 +1044,8 @@ namespace Rollback
 
 	void OnExecutionExit()
 	{
+		if (sess::OnExit())
+			return;
 		if (s_pending == Pending::None)
 			return;
 

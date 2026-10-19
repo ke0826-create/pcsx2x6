@@ -361,4 +361,9 @@ DEFINE_HOTKEY("RollbackSelfTest", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE
 		if (!pressed && VMManager::HasValidVM())
 			Rollback::RequestSelfTest();
 	})
+DEFINE_HOTKEY("RollbackSessionTest", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Rollback Session Test (late inputs)"),
+	[](s32 pressed) {
+		if (!pressed && VMManager::HasValidVM())
+			Rollback::RequestSessionTest();
+	})
 END_HOTKEY_LIST()
