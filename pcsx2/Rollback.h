@@ -16,6 +16,10 @@ namespace Rollback
 	/// Cheap (one branch) when no test is running.
 	void OnVSync();
 
+	/// Called from VMManager::Execute() right after the CPU execution loop has been left (a clean point:
+	/// no event handler is in flight). Performs the pending state save/load requested from OnVSync().
+	void OnExecutionExit();
+
 	/// Arms the self-test; it starts at the next frame boundary. Ignored while a test is running.
 	void RequestSelfTest();
 

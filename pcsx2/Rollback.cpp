@@ -3,9 +3,11 @@
 
 #include "Rollback.h"
 
+#include "Common.h"
 #include "Config.h"
 #include "DEV9/ACJV.h"
 #include "MemoryTypes.h"
+#include "R5900.h"
 #include "VMManager.h"
 
 #include "common/Console.h"
@@ -29,16 +31,20 @@
 // The test runs a small matrix of configurations (scripted input on/off x re-simulation speed
 // normal/unlimited). For each configuration:
 //
-//   frame boundary k   : save a state (file), n = 0
+//   frame boundary k   : request "leave the CPU loop"; right after the loop is left (a clean point,
+//                        no event handler in flight) save a state (file), n = 0
 //   frames n = 1..N    : (optional) scripted JVS input as a pure function of n; normal speed
 //   n == N             : copy EE RAM -> reference
-//   restore            : load the state, n = 0
+//   restore            : request "leave the CPU loop"; at the clean point load the state, n = 0
 //   frames n = 1..N    : the SAME scripted input; normal or unlimited speed
 //   n == N             : copy EE RAM, compare with the reference and with the first re-simulation
 //   repeat the restore/re-simulate/compare kRepeats times
 //
 // A hash of the first 32 MB of EE RAM is taken at every frame boundary, so a mismatch is reported
 // together with the first frame index at which the runs diverge (0 = right after the load).
+//
+// Saving/loading only at the clean point matters: 1447cc1/fa60cbb saved and loaded from inside the
+// VSyncStart handler and every restored run diverged from the live run in the first frame.
 //
 // The log (emulog.txt / console) gets lines starting with "RollbackTest:".
 //  * Rendering is NOT skipped during the re-simulation; the measured speed is therefore a
@@ -52,8 +58,17 @@ namespace Rollback
 		enum class Phase
 		{
 			Idle,
+			WaitSave,  // asked the CPU loop to exit; the snapshot is taken at the clean point
 			Reference, // running the first (reference) pass
+			WaitLoad,  // asked the CPU loop to exit; the state is loaded at the clean point
 			Resim,     // running a re-simulation pass after a state load
+		};
+
+		enum class Pending
+		{
+			None,
+			Save,
+			Load,
 		};
 
 		struct Cfg
@@ -84,6 +99,7 @@ namespace Rollback
 			JVS_BTN_1, JVS_BTN_2, JVS_BTN_3, JVS_BTN_4};
 
 		Phase s_phase = Phase::Idle;
+		Pending s_pending = Pending::None;
 		bool s_requested = false;
 		u32 s_cfg = 0;    // index into kMatrix
 		u32 s_n = 0;      // frames since the snapshot
@@ -252,6 +268,7 @@ namespace Rollback
 				VMManager::SetLimiterMode(s_prev_limiter);
 			ApplyMask(0);
 			s_phase = Phase::Idle;
+			s_pending = Pending::None;
 			s_requested = false;
 			s_ref.clear();
 			s_ref.shrink_to_fit();
@@ -262,6 +279,14 @@ namespace Rollback
 			Console.WriteLn("RollbackTest: finished (%s): %u PASS / %u FAIL (vs reference)", why, s_pass, s_fail);
 		}
 
+		// Asks the CPU loop to exit; the action runs in OnExecutionExit().
+		void RequestAction(Pending what, Phase wait_phase)
+		{
+			s_pending = what;
+			s_phase = wait_phase;
+			Cpu->ExitExecution();
+		}
+
 		void BeginConfig()
 		{
 			s_n = 0;
@@ -269,7 +294,21 @@ namespace Rollback
 			s_hash_ms = 0.0;
 			VMManager::SetLimiterMode(s_prev_limiter);
 			ApplyMask(0);
+			RequestAction(Pending::Save, Phase::WaitSave);
+		}
 
+		void NextConfig()
+		{
+			s_cfg++;
+			if (s_cfg < static_cast<u32>(std::size(kMatrix)))
+				BeginConfig();
+			else
+				EndTest("done");
+		}
+
+		// Runs at the clean point after the CPU loop was left.
+		void DoSave()
+		{
 			bool save_ok = true;
 			Common::Timer timer;
 			VMManager::SaveState(s_state_path.c_str(), false, false,
@@ -284,24 +323,18 @@ namespace Rollback
 				return;
 			}
 
+			s_hash_ms = 0.0;
 			RecordHash(s_hash_ref, 0);
 			Console.WriteLn("RollbackTest: [%u/%u] config '%s': snapshot saved in %.1f ms; running reference pass",
 				s_cfg + 1, static_cast<u32>(std::size(kMatrix)), kMatrix[s_cfg].name, ms_save);
+			s_n = 0;
 			s_phase = Phase::Reference;
 			s_hash_ms = 0.0;
 			s_timer.Reset();
 		}
 
-		void NextConfig()
-		{
-			s_cfg++;
-			if (s_cfg < static_cast<u32>(std::size(kMatrix)))
-				BeginConfig();
-			else
-				EndTest("done");
-		}
-
-		void StartResim()
+		// Runs at the clean point after the CPU loop was left.
+		void DoLoad()
 		{
 			Error error;
 			Common::Timer timer;
@@ -400,6 +433,9 @@ namespace Rollback
 			return;
 		}
 
+		if (s_phase == Phase::WaitSave || s_phase == Phase::WaitLoad)
+			return; // the CPU loop is about to exit; nothing to count
+
 		s_n++;
 		RecordHash((s_phase == Phase::Reference) ? s_hash_ref : s_hash_cur, s_n);
 		ApplyMask(ScriptMask(s_n));
@@ -410,7 +446,7 @@ namespace Rollback
 		{
 			CopyRam(s_ref);
 			s_ms_ref = s_timer.GetTimeMilliseconds();
-			StartResim();
+			RequestAction(Pending::Load, Phase::WaitLoad);
 			return;
 		}
 
@@ -420,8 +456,27 @@ namespace Rollback
 		ReportResim(resim_ms);
 		s_repeat++;
 		if (s_repeat < kRepeats)
-			StartResim();
+			RequestAction(Pending::Load, Phase::WaitLoad);
 		else
 			NextConfig();
+	}
+
+	void OnExecutionExit()
+	{
+		if (s_pending == Pending::None)
+			return;
+
+		const Pending what = s_pending;
+		s_pending = Pending::None;
+		if (!VMManager::HasValidVM() || VMManager::GetState() != VMState::Running)
+		{
+			EndTest("execution interrupted");
+			return;
+		}
+
+		if (what == Pending::Save)
+			DoSave();
+		else
+			DoLoad();
 	}
 } // namespace Rollback

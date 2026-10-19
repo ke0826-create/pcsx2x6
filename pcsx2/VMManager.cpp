@@ -31,6 +31,7 @@
 #include "R3000A.h"
 #include "R5900.h"
 #include "Recording/InputRecording.h"
+#include "Rollback.h"
 #include "Recording/InputRecordingControls.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Pad/Pad.h"
@@ -2974,6 +2975,9 @@ void VMManager::Execute()
 
 	// Execute until we're asked to stop.
 	Cpu->Execute();
+
+	// Clean point (outside any event handler): rollback self-test state save/load.
+	Rollback::OnExecutionExit();
 }
 
 void VMManager::IdlePollUpdate()
