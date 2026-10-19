@@ -14,6 +14,7 @@
 #include "common/Timer.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <string>
@@ -25,18 +26,21 @@
 // Trigger: hotkey "RollbackSelfTest" (default F10) while a game is running, ideally in the
 // middle of a CPU battle with nobody touching the pad.
 //
-//   frame boundary k   : press a scripted JVS input, save a state (file), n = 0
-//   frames n = 1..N    : scripted JVS input as a pure function of n, normal speed
+// The test runs a small matrix of configurations (scripted input on/off x re-simulation speed
+// normal/unlimited). For each configuration:
+//
+//   frame boundary k   : save a state (file), n = 0
+//   frames n = 1..N    : (optional) scripted JVS input as a pure function of n; normal speed
 //   n == N             : copy EE RAM -> reference
-//   restore            : load the state, n = 0, limiter = Unlimited (fast re-simulation)
-//   frames n = 1..N    : the SAME scripted input
-//   n == N             : copy EE RAM -> compare with the reference
+//   restore            : load the state, n = 0
+//   frames n = 1..N    : the SAME scripted input; normal or unlimited speed
+//   n == N             : copy EE RAM, compare with the reference and with the first re-simulation
 //   repeat the restore/re-simulate/compare kRepeats times
 //
-// The log (emulog.txt / console) gets lines starting with "RollbackTest:". PASS means the EE RAM
-// was identical (outside the known volatile I/O-board counter) after every re-simulation.
+// A hash of the first 32 MB of EE RAM is taken at every frame boundary, so a mismatch is reported
+// together with the first frame index at which the runs diverge (0 = right after the load).
 //
-// Notes
+// The log (emulog.txt / console) gets lines starting with "RollbackTest:".
 //  * Rendering is NOT skipped during the re-simulation; the measured speed is therefore a
 //    conservative number for "how fast can we re-simulate".
 //  * The state goes through the normal zip save state path (includes GS), so the save/load times
@@ -52,8 +56,23 @@ namespace Rollback
 			Resim,     // running a re-simulation pass after a state load
 		};
 
+		struct Cfg
+		{
+			bool input;     // drive the JVS buttons from the script
+			bool unlimited; // re-simulate with the limiter off
+			const char* name;
+		};
+
+		constexpr Cfg kMatrix[] = {
+			{false, false, "no-input/normal-speed"},
+			{false, true, "no-input/unlimited"},
+			{true, false, "input/normal-speed"},
+			{true, true, "input/unlimited"},
+		};
+
 		constexpr u32 kFrames = 120; // frames per pass (N)
-		constexpr u32 kRepeats = 3;  // number of restore + re-simulate passes
+		constexpr u32 kRepeats = 2;  // restore + re-simulate passes per configuration
+		constexpr u32 kHashBytes = 32u * 1024u * 1024u; // per-frame hash covers the first 32 MB
 
 		// 64-byte line holding the USB I/O board status counter (".;RAYS PCB;"), measured to differ
 		// between a straight run and a restored run without affecting the game logic (2026-10-19).
@@ -66,8 +85,9 @@ namespace Rollback
 
 		Phase s_phase = Phase::Idle;
 		bool s_requested = false;
+		u32 s_cfg = 0;    // index into kMatrix
 		u32 s_n = 0;      // frames since the snapshot
-		u32 s_repeat = 0; // completed re-simulations
+		u32 s_repeat = 0; // completed re-simulations of the current configuration
 		u32 s_pass = 0;
 		u32 s_fail = 0;
 		u16 s_mask = 0; // script bits currently pressed
@@ -75,8 +95,12 @@ namespace Rollback
 		std::string s_state_path;
 		std::vector<u8> s_ref;
 		std::vector<u8> s_cur;
+		std::vector<u8> s_first; // first re-simulation of the current configuration
+		std::vector<u64> s_hash_ref;
+		std::vector<u64> s_hash_cur;
+		std::vector<u64> s_hash_first;
 		Common::Timer s_timer;
-		double s_ms_save = 0.0;
+		double s_hash_ms = 0.0; // time spent hashing in the current pass
 		double s_ms_load = 0.0;
 		double s_ms_ref = 0.0;
 
@@ -95,11 +119,47 @@ namespace Rollback
 			std::memcpy(out.data(), eeMem->Main, size);
 		}
 
+		// FNV-1a style 64-bit hash over the first 32 MB, skipping the known volatile line.
+		u64 HashRam()
+		{
+			const u64* p = reinterpret_cast<const u64*>(eeMem->Main);
+			const size_t total = std::min<size_t>(RamSize(), kHashBytes) / 8;
+			const size_t vb = kVolatileBegin / 8;
+			const size_t ve = kVolatileEnd / 8;
+			u64 h = 1469598103934665603ull;
+			for (size_t i = 0; i < vb && i < total; i++)
+				h = (h ^ p[i]) * 1099511628211ull;
+			for (size_t i = ve; i < total; i++)
+				h = (h ^ p[i]) * 1099511628211ull;
+			return h;
+		}
+
+		void RecordHash(std::vector<u64>& dst, u32 index)
+		{
+			Common::Timer t;
+			if (dst.size() < static_cast<size_t>(kFrames) + 1)
+				dst.resize(static_cast<size_t>(kFrames) + 1, 0);
+			dst[index] = HashRam();
+			s_hash_ms += t.GetTimeMilliseconds();
+		}
+
+		// First frame index at which the two hash sequences differ, or -1.
+		int FirstDivergence(const std::vector<u64>& a, const std::vector<u64>& b)
+		{
+			const size_t n = std::min(a.size(), b.size());
+			for (size_t i = 0; i < n && i <= kFrames; i++)
+			{
+				if (a[i] != b[i])
+					return static_cast<int>(i);
+			}
+			return -1;
+		}
+
 		// Scripted input: a pure function of the frame index n (so the reference pass and every
 		// re-simulation see exactly the same input at exactly the same frame).
 		u16 ScriptMask(u32 n)
 		{
-			if (n == 0 || n >= kFrames)
+			if (!kMatrix[s_cfg].input || n == 0 || n >= kFrames)
 				return 0;
 			const u32 h = (n / 6 + 1) * 2654435761u;
 			u16 mask = 0;
@@ -152,6 +212,40 @@ namespace Rollback
 			return r;
 		}
 
+		std::string HexPreview(const std::vector<u8>& v, u32 off)
+		{
+			std::string s;
+			char tmp[4];
+			for (u32 i = 0; i < 16 && off + i < v.size(); i++)
+			{
+				std::snprintf(tmp, sizeof(tmp), "%02x", v[off + i]);
+				s += tmp;
+			}
+			return s;
+		}
+
+		// Prints one comparison; returns true when the two RAM images match.
+		bool LogCompare(const char* tag, const std::vector<u8>& a, const std::vector<u8>& b, int first_div)
+		{
+			const DiffResult d = Diff(a, b);
+			const bool ok = (d.lines == 0);
+			Console.WriteLn("RollbackTest:   %s: %s differing 64B lines=%u (known-volatile ignored=%u) first-divergent-frame=%d",
+				tag, ok ? "MATCH" : "DIFFER", d.lines, d.ignored, first_div);
+			if (!ok)
+			{
+				const size_t shown = std::min<size_t>(d.ranges.size(), 12);
+				for (size_t i = 0; i < shown; i++)
+				{
+					const u32 begin = d.ranges[i].first;
+					Console.WriteLn("RollbackTest:     0x%06X-0x%06X (%u B) A=%s B=%s", begin, d.ranges[i].second,
+						d.ranges[i].second - begin, HexPreview(a, begin).c_str(), HexPreview(b, begin).c_str());
+				}
+				if (d.ranges.size() > shown)
+					Console.WriteLn("RollbackTest:     ... and %u more ranges", static_cast<u32>(d.ranges.size() - shown));
+			}
+			return ok;
+		}
+
 		void EndTest(const char* why)
 		{
 			if (VMManager::HasValidVM())
@@ -163,7 +257,48 @@ namespace Rollback
 			s_ref.shrink_to_fit();
 			s_cur.clear();
 			s_cur.shrink_to_fit();
-			Console.WriteLn("RollbackTest: finished (%s): %u PASS / %u FAIL", why, s_pass, s_fail);
+			s_first.clear();
+			s_first.shrink_to_fit();
+			Console.WriteLn("RollbackTest: finished (%s): %u PASS / %u FAIL (vs reference)", why, s_pass, s_fail);
+		}
+
+		void BeginConfig()
+		{
+			s_n = 0;
+			s_repeat = 0;
+			s_hash_ms = 0.0;
+			VMManager::SetLimiterMode(s_prev_limiter);
+			ApplyMask(0);
+
+			bool save_ok = true;
+			Common::Timer timer;
+			VMManager::SaveState(s_state_path.c_str(), false, false,
+				[&save_ok](const std::string& message) {
+					save_ok = false;
+					Console.Error("RollbackTest: SaveState failed: %s", message.c_str());
+				});
+			const double ms_save = timer.GetTimeMilliseconds();
+			if (!save_ok)
+			{
+				EndTest("save failed");
+				return;
+			}
+
+			RecordHash(s_hash_ref, 0);
+			Console.WriteLn("RollbackTest: [%u/%u] config '%s': snapshot saved in %.1f ms; running reference pass",
+				s_cfg + 1, static_cast<u32>(std::size(kMatrix)), kMatrix[s_cfg].name, ms_save);
+			s_phase = Phase::Reference;
+			s_hash_ms = 0.0;
+			s_timer.Reset();
+		}
+
+		void NextConfig()
+		{
+			s_cfg++;
+			if (s_cfg < static_cast<u32>(std::size(kMatrix)))
+				BeginConfig();
+			else
+				EndTest("done");
 		}
 
 		void StartResim()
@@ -182,68 +317,51 @@ namespace Rollback
 			// scripted input back to its initial (released) state.
 			s_n = 0;
 			ApplyMask(0);
+			s_hash_ms = 0.0;
+			RecordHash(s_hash_cur, 0);
+			s_hash_ms = 0.0;
 			s_phase = Phase::Resim;
-			VMManager::SetLimiterMode(LimiterModeType::Unlimited);
+			VMManager::SetLimiterMode(kMatrix[s_cfg].unlimited ? LimiterModeType::Unlimited : s_prev_limiter);
 			s_timer.Reset();
 		}
 
 		void BeginTest()
 		{
 			s_requested = false;
-			s_n = 0;
-			s_repeat = 0;
+			s_cfg = 0;
 			s_pass = 0;
 			s_fail = 0;
 			s_prev_limiter = VMManager::GetLimiterMode();
 			s_state_path = Path::Combine(EmuFolders::Savestates, "rollback_selftest.p2s");
-			ApplyMask(0);
 
-			Console.WriteLn("RollbackTest: begin. frames=%u repeats=%u ram=%u MB state=%s",
-				kFrames, kRepeats, RamSize() >> 20, s_state_path.c_str());
-
-			bool save_ok = true;
-			Common::Timer timer;
-			VMManager::SaveState(s_state_path.c_str(), false, false,
-				[&save_ok](const std::string& message) {
-					save_ok = false;
-					Console.Error("RollbackTest: SaveState failed: %s", message.c_str());
-				});
-			s_ms_save = timer.GetTimeMilliseconds();
-			if (!save_ok)
-			{
-				EndTest("save failed");
-				return;
-			}
-
-			Console.WriteLn("RollbackTest: snapshot saved in %.1f ms; running reference pass", s_ms_save);
-			s_phase = Phase::Reference;
-			s_timer.Reset();
+			Console.WriteLn("RollbackTest: begin. frames=%u repeats=%u configs=%u ram=%u MB state=%s",
+				kFrames, kRepeats, static_cast<u32>(std::size(kMatrix)), RamSize() >> 20, s_state_path.c_str());
+			BeginConfig();
 		}
 
-		void ReportResim(double resim_ms)
+		void ReportResim(double resim_total_ms)
 		{
-			const DiffResult d = Diff(s_ref, s_cur);
-			const bool ok = (d.lines == 0);
+			const double net_ms = resim_total_ms - s_hash_ms;
+			Console.WriteLn("RollbackTest: [%u/%u] '%s' resim %u/%u: load=%.1f ms, %u frames in %.1f ms (excluding hashing) = %.0f frames/s; "
+							"reference pass %.1f ms",
+				s_cfg + 1, static_cast<u32>(std::size(kMatrix)), kMatrix[s_cfg].name, s_repeat + 1, kRepeats,
+				s_ms_load, kFrames, net_ms, (net_ms > 0.0) ? (kFrames * 1000.0 / net_ms) : 0.0, s_ms_ref);
+
+			const int load_div = (s_hash_ref[0] == s_hash_cur[0]) ? -1 : 0;
+			const bool ok = LogCompare("vs reference", s_ref, s_cur, (load_div == 0) ? 0 : FirstDivergence(s_hash_ref, s_hash_cur));
 			if (ok)
 				s_pass++;
 			else
 				s_fail++;
 
-			Console.WriteLn("RollbackTest: pass %u/%u %s: differing 64B lines=%u (known-volatile ignored=%u); "
-							"load=%.1f ms, resim %u frames in %.1f ms = %.0f frames/s (reference pass %.1f ms)",
-				s_repeat + 1, kRepeats, ok ? "PASS" : "FAIL", d.lines, d.ignored, s_ms_load,
-				kFrames, resim_ms, (resim_ms > 0.0) ? (kFrames * 1000.0 / resim_ms) : 0.0, s_ms_ref);
-
-			if (!ok)
+			if (s_repeat == 0)
 			{
-				const size_t shown = std::min<size_t>(d.ranges.size(), 24);
-				for (size_t i = 0; i < shown; i++)
-				{
-					Console.Error("RollbackTest:   diff 0x%06X-0x%06X (%u bytes)",
-						d.ranges[i].first, d.ranges[i].second, d.ranges[i].second - d.ranges[i].first);
-				}
-				if (d.ranges.size() > shown)
-					Console.Error("RollbackTest:   ... and %u more ranges", static_cast<u32>(d.ranges.size() - shown));
+				s_first = s_cur;
+				s_hash_first = s_hash_cur;
+			}
+			else
+			{
+				LogCompare("vs first re-simulation", s_first, s_cur, FirstDivergence(s_hash_first, s_hash_cur));
 			}
 		}
 	} // namespace
@@ -283,6 +401,7 @@ namespace Rollback
 		}
 
 		s_n++;
+		RecordHash((s_phase == Phase::Reference) ? s_hash_ref : s_hash_cur, s_n);
 		ApplyMask(ScriptMask(s_n));
 		if (s_n < kFrames)
 			return;
@@ -303,6 +422,6 @@ namespace Rollback
 		if (s_repeat < kRepeats)
 			StartResim();
 		else
-			EndTest("done");
+			NextConfig();
 	}
 } // namespace Rollback
