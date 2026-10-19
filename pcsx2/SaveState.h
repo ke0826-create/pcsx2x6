@@ -58,6 +58,25 @@ extern bool SaveState_ZipToDisk(
 	std::unique_ptr<ArchiveEntryList> srclist, std::unique_ptr<SaveStateScreenshotData> screenshot,
 	const char* filename, Error* error);
 extern bool SaveState_ReadScreenshot(const std::string& filename, u32* out_width, u32* out_height, std::vector<u32>* out_pixels);
+
+// When true, the normal (zip) save/load paths log how long each phase takes ("SaveStateProfile: ...").
+extern bool g_SaveStateProfile;
+
+// Rollback: an in-memory snapshot. Same contents as a normal save state except: no zip/compression,
+// no screenshot, no GS (VRAM and registers stay as they are; the game re-sends GS state every frame),
+// no USB/PAD/achievements, and only the first ee_bytes of EE RAM. Keep the object between calls: the
+// buffers keep their capacity, so after the first call a save does not allocate.
+struct FastSnapshot
+{
+	std::vector<u8> internals; // BIOS tag + FreezeInternals (memSavingState format)
+	std::vector<u8> ee;        // EE RAM [0, ee.size())
+	std::vector<u8> other;     // IOP RAM, HW registers, scratchpad, VU memories, SPU2 (fixed order)
+};
+
+// log = print the per-phase timings of this call.
+extern bool SaveState_FastSave(FastSnapshot& snap, u32 ee_bytes, bool log, Error* error);
+// keep_jit = do not throw away the recompiler caches (only valid while the code in RAM is unchanged).
+extern bool SaveState_FastLoad(const FastSnapshot& snap, bool keep_jit, bool log, Error* error);
 extern bool SaveState_UnzipFromDisk(const std::string& filename, Error* error);
 
 // --------------------------------------------------------------------------------------

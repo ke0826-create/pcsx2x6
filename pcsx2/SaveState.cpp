@@ -36,6 +36,7 @@
 #include "common/Path.h"
 #include "common/ScopedGuard.h"
 #include "common/StringUtil.h"
+#include "common/Timer.h"
 #include "common/ZipHelpers.h"
 
 #include "IconsFontAwesome.h"
@@ -47,6 +48,30 @@
 using namespace R5900;
 
 static tlbs s_tlb_backup[std::size(tlb)];
+
+bool g_SaveStateProfile = false;
+
+namespace
+{
+	// Logs the time since the previous lap when enabled.
+	struct ProfLap
+	{
+		Common::Timer timer;
+		const char* prefix;
+		bool enabled;
+		ProfLap(const char* p, bool en)
+			: prefix(p)
+			, enabled(en)
+		{
+		}
+		void Lap(const char* what)
+		{
+			const double ms = timer.GetTimeMillisecondsAndReset();
+			if (enabled)
+				Console.WriteLn("SaveStateProfile: %s %-26s %.2f ms", prefix, what, ms);
+		}
+	};
+} // namespace
 
 static void PreLoadPrep()
 {
@@ -712,8 +737,10 @@ static const std::unique_ptr<BaseSavestateEntry> SavestateEntries[] = {
 
 std::unique_ptr<ArchiveEntryList> SaveState_DownloadState(Error* error)
 {
+	ProfLap prof("save", g_SaveStateProfile);
 	std::unique_ptr<ArchiveEntryList> destlist = std::make_unique<ArchiveEntryList>();
 	destlist->GetBuffer().resize(1024 * 1024 * 64);
+	prof.Lap("alloc 64MB buffer");
 
 	memSavingState saveme(destlist->GetBuffer());
 	ArchiveEntry internals(EntryFilename_InternalStructures);
@@ -735,6 +762,7 @@ std::unique_ptr<ArchiveEntryList> SaveState_DownloadState(Error* error)
 
 	internals.SetDataSize(saveme.GetCurrentPos() - internals.GetDataIndex());
 	destlist->Add(internals);
+	prof.Lap("FreezeBios+Internals");
 
 	for (const std::unique_ptr<BaseSavestateEntry>& entry : SavestateEntries)
 	{
@@ -750,6 +778,7 @@ std::unique_ptr<ArchiveEntryList> SaveState_DownloadState(Error* error)
 			ArchiveEntry(entry->GetFilename())
 				.SetDataIndex(startpos)
 				.SetDataSize(saveme.GetCurrentPos() - startpos));
+		prof.Lap(entry->GetFilename());
 	}
 
 	return destlist;
@@ -1164,6 +1193,7 @@ static bool LoadInternalStructuresState(zip_t* zf, s64 index, Error* error)
 
 bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
 {
+	ProfLap prof("load", g_SaveStateProfile);
 	zip_error_t ze = {};
 	auto zf = zip_open_managed(filename.c_str(), ZIP_RDONLY, &ze);
 	if (!zf)
@@ -1203,7 +1233,10 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
 		return false;
 	}
 
+	prof.Lap("open+version+index");
+
 	PreLoadPrep();
+	prof.Lap("PreLoadPrep");
 
 	if (!LoadInternalStructuresState(zf.get(), internal_index, error))
 	{
@@ -1213,6 +1246,7 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
 		VMManager::Reset();
 		return false;
 	}
+	prof.Lap("internals (unzip+load)");
 
 	for (u32 i = 0; i < std::size(SavestateEntries); ++i)
 	{
@@ -1229,9 +1263,118 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
 			VMManager::Reset();
 			return false;
 		}
+		prof.Lap(SavestateEntries[i]->GetFilename());
 	}
 
 	PostLoadPrep();
+	prof.Lap("PostLoadPrep");
+	return true;
+}
+
+// --------------------------------------------------------------------------------------
+//  Rollback: in-memory snapshot (see SaveState.h)
+// --------------------------------------------------------------------------------------
+static bool FastFreezeSpu2(SaveStateBase& state, bool saving)
+{
+	freezeData fP = {};
+	if (SPU2freeze(FreezeAction::Size, &fP) != 0)
+		return false;
+	if (fP.size == 0)
+		return true;
+
+	const int size = fP.size;
+	state.PrepBlock(size);
+	if (!state.IsOkay())
+		return false;
+
+	fP.data = state.GetBlockPtr();
+	if (SPU2freeze(saving ? FreezeAction::Save : FreezeAction::Load, &fP) != 0)
+		return false;
+	state.CommitBlock(size);
+	return true;
+}
+
+// The IOP/HW/VU memory blocks, in the same order as the normal save state entries.
+static void FastFreezeBlocks(SaveStateBase& state, ProfLap& prof)
+{
+	state.FreezeMem(iopMem->Main, static_cast<int>(Ps2MemSize::ExposedIopRam));
+	prof.Lap("IOP RAM");
+	state.FreezeMem(eeHw, static_cast<int>(sizeof(eeHw)));
+	state.FreezeMem(iopHw, static_cast<int>(sizeof(iopHw)));
+	state.FreezeMem(eeMem->Scratch, static_cast<int>(sizeof(eeMem->Scratch)));
+	state.FreezeMem(vuRegs[0].Mem, static_cast<int>(VU0_MEMSIZE));
+	state.FreezeMem(vuRegs[1].Mem, static_cast<int>(VU1_MEMSIZE));
+	state.FreezeMem(vuRegs[0].Micro, static_cast<int>(VU0_PROGSIZE));
+	state.FreezeMem(vuRegs[1].Micro, static_cast<int>(VU1_PROGSIZE));
+	prof.Lap("HW regs + VU memories");
+}
+
+bool SaveState_FastSave(FastSnapshot& snap, u32 ee_bytes, bool log, Error* error)
+{
+	ProfLap prof("fast-save", log);
+	ee_bytes = std::min<u32>(ee_bytes, Ps2MemSize::ExposedRam);
+
+	// The vectors are NOT cleared: memSavingState only grows a buffer when it has to, so a buffer that
+	// already has the right size is overwritten in place without being zero-filled first.
+	{
+		memSavingState saveme(snap.internals);
+		if (!saveme.FreezeBios() || !saveme.FreezeInternals(error))
+			return false;
+	}
+	prof.Lap("FreezeBios+Internals");
+
+	snap.ee.resize(ee_bytes);
+	std::memcpy(snap.ee.data(), eeMem->Main, ee_bytes);
+	prof.Lap("EE RAM copy");
+
+	{
+		memSavingState saveme(snap.other);
+		FastFreezeBlocks(saveme, prof);
+		if (!FastFreezeSpu2(saveme, true))
+			return false;
+	}
+	prof.Lap("SPU2");
+	return true;
+}
+
+bool SaveState_FastLoad(const FastSnapshot& snap, bool keep_jit, bool log, Error* error)
+{
+	ProfLap prof("fast-load", log);
+
+	// Same preparation as PreLoadPrep(), optionally keeping the recompiler caches.
+	if (THREAD_VU1)
+		vu1Thread.WaitVU();
+	MTGS::WaitGS(false);
+	prof.Lap("WaitVU+WaitGS");
+
+	std::memcpy(s_tlb_backup, tlb, sizeof(s_tlb_backup));
+	mmap_ResetBlockTracking();
+	prof.Lap("tlb backup+ResetBlockTracking");
+
+	if (!keep_jit)
+		VMManager::Internal::ClearCPUExecutionCaches();
+	prof.Lap("ClearCPUExecutionCaches");
+
+	{
+		memLoadingState state(snap.internals);
+		if (!state.FreezeBios() || !state.FreezeInternals(error))
+			return false;
+	}
+	prof.Lap("FreezeBios+Internals");
+
+	std::memcpy(eeMem->Main, snap.ee.data(), snap.ee.size());
+	prof.Lap("EE RAM copy");
+
+	{
+		memLoadingState state(snap.other);
+		FastFreezeBlocks(state, prof);
+		if (!FastFreezeSpu2(state, false))
+			return false;
+	}
+	prof.Lap("SPU2");
+
+	PostLoadPrep();
+	prof.Lap("PostLoadPrep");
 	return true;
 }
 

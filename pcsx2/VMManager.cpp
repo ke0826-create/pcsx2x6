@@ -2127,6 +2127,7 @@ void VMManager::DoSaveState(const char* filename, s32 slot_for_message, bool zip
 		return;
 	}
 
+	Common::Timer prof_timer;
 	Error error;
 	std::unique_ptr<ArchiveEntryList> elist = SaveState_DownloadState(&error);
 	if (!elist)
@@ -2134,8 +2135,12 @@ void VMManager::DoSaveState(const char* filename, s32 slot_for_message, bool zip
 		error_callback(error.GetDescription());
 		return;
 	}
+	if (g_SaveStateProfile)
+		Console.WriteLn("SaveStateProfile: save TOTAL SaveState_DownloadState %.2f ms", prof_timer.GetTimeMillisecondsAndReset());
 
 	std::unique_ptr<SaveStateScreenshotData> screenshot = SaveState_SaveScreenshot();
+	if (g_SaveStateProfile)
+		Console.WriteLn("SaveStateProfile: save screenshot (GS readback) %.2f ms", prof_timer.GetTimeMillisecondsAndReset());
 
 	if (FileSystem::FileExists(filename) && backup_old_state)
 	{
@@ -2189,6 +2194,8 @@ void VMManager::ZipSaveState(std::unique_ptr<ArchiveEntryList> elist,
 	}
 
 	DevCon.WriteLn("Zipping save state to '%s' took %.2f ms", filename, timer.GetTimeMilliseconds());
+	if (g_SaveStateProfile)
+		Console.WriteLn("SaveStateProfile: save zip+write to disk %.2f ms", timer.GetTimeMilliseconds());
 }
 
 void VMManager::ZipSaveStateOnThread(std::unique_ptr<ArchiveEntryList> elist,
