@@ -536,16 +536,46 @@ namespace Rollback
 		//   ground truth : S0 -> kN frames with the true inputs on time -> EE RAM
 		//   session      : S0 -> kN frames with late inputs + rollbacks   -> EE RAM   (must be identical)
 		//
+		// Two ways to give the game its input:
+		//   JVS (F11)     : ACJV::SetButtonState, as a human on the pad would.
+		//   mailbox (F12) : the guest's human-unit input reader is patched to read its pad word from an
+		//                   emulator-owned table in EE RAM (kMailbox + slot * 0x40) instead of the guest's
+		//                   pad array; the emulator writes the word for frame n at hook n. This is the entry
+		//                   point for the inputs of the other human slots in netplay (design memo, chapter 14).
+		//                   The words are the ones the guest's own pad driver produced in the JVS ground truth
+		//                   run (*(0x5E8B70) read at the next hook), so no bit mapping has to be reproduced.
+		//
 		// Snapshots are taken every kK frames into a ring (a snapshot is valid until a misprediction at an
 		// earlier frame is found; then it is dropped). Hook n applies the input of "frame n"; the snapshot of
 		// frame n is taken at the clean point right after hook n (start of frame n, input n applied).
-		// The clean point rule is the same as in the other test: only OnExecutionExit() saves or loads.
+		// The clean point rule is the same as in the other test: only OnExecutionExit() saves, loads or
+		// patches guest code.
 		namespace sess
 		{
 			constexpr u32 kN = 720;   // frames per run
 			constexpr u32 kK = 4;     // snapshot interval
 			constexpr u32 kRing = 5;  // snapshots kept (covers about kK * kRing frames)
 			constexpr u32 kNone = 0xFFFFFFFFu;
+
+			constexpr u32 kMailbox = 0x2000000; // EE RAM address of the input mailbox (above the game's 32 MB)
+			constexpr u32 kMailboxStride = 0x40;
+			constexpr u32 kDevicePad = 0x5E8B70; // the guest pad driver's output for pad 0 (cur word at +0)
+
+			// Guest patch (all 4 words are in the input reader 0x282540, at the two places where it builds the
+			// base address of the pad array: lui v0,0x5f / addiu v0,v0,-0x7590 = 0x5E8A70):
+			// the base becomes 0x2000000 (the mailbox). CPU units (unit+0xA != 0) do not read the pad.
+			struct PatchWord
+			{
+				u32 addr;
+				u32 original;
+				u32 patched;
+			};
+			constexpr PatchWord kPatch[] = {
+				{0x28259C, 0x3C02005F, 0x3C020200}, // lui   v0,0x5f       -> lui   v0,0x200   (mode == 1 path)
+				{0x2825A0, 0x24428A70, 0x24420000}, // addiu v0,v0,-0x7590 -> addiu v0,v0,0
+				{0x2825C0, 0x3C02005F, 0x3C020200}, // lui   v0,0x5f       -> lui   v0,0x200   (normal path)
+				{0x2825C4, 0x24428A70, 0x24420000}, // addiu v0,v0,-0x7590 -> addiu v0,v0,0
+			};
 
 			enum class Pat
 			{
@@ -562,7 +592,6 @@ namespace Rollback
 			};
 
 			constexpr Pattern kPatterns[] = {
-				{Pat::Fixed, 0, "on time (snapshots only, no rollbacks)"},
 				{Pat::Fixed, 3, "fixed delay 3"},
 				{Pat::Fixed, 8, "fixed delay 8"},
 				{Pat::Jitter, 10, "jitter 0-10"},
@@ -572,17 +601,20 @@ namespace Rollback
 			enum class Step
 			{
 				Idle,
-				Gt,  // ground-truth run
-				Run, // session run (live or re-simulating)
+				Gt,   // ground-truth run, JVS inputs (records the pad words in mailbox mode)
+				GtMb, // ground-truth run, mailbox inputs, on time (mailbox mode only)
+				Run,  // session run (live or re-simulating)
 			};
 
 			enum class Act
 			{
 				None,
-				Init,     // take S0
-				Restore0, // restore S0 and start the next pattern
-				Save,     // take a ring snapshot
-				Rollback, // restore a ring snapshot
+				Init,       // take S0
+				RestoreGt2, // restore S0, patch the guest, start the mailbox ground truth
+				Restore0,   // restore S0 (re-patch in mailbox mode) and start the next pattern
+				Save,       // take a ring snapshot
+				Rollback,   // restore a ring snapshot
+				Cleanup,    // remove the guest patch, finish
 			};
 
 			struct Slot
@@ -593,6 +625,9 @@ namespace Rollback
 			};
 
 			bool requested = false;
+			bool want_mailbox = false; // the pending request is the mailbox test (F12)
+			bool mb_mode = false;      // inputs go through the mailbox
+			bool patched = false;      // the guest patch is in place
 			Step step = Step::Idle;
 			Act act = Act::None;
 			u32 pat = 0;
@@ -604,12 +639,15 @@ namespace Rollback
 			u32 roll_slot = 0;
 			FastSnapshot s0;
 			Slot ring[kRing];
-			std::vector<u8> gt_ram;
+			std::vector<u8> gt_ram;  // ground truth the patterns are compared with
+			std::vector<u8> jvs_ram; // JVS ground truth (mailbox mode: for the equivalence check)
 			std::vector<u8> rb_ram;
-			u16 truth[kN + 1] = {};
+			u16 jvs_truth[kN + 1] = {};
+			u32 devw[kN + 1] = {};    // pad words the guest produced for frame f in the JVS run
+			u32 truth[kN + 1] = {};   // the input words the session delivers
 			bool delivered[kN + 1] = {};
 			u32 deliver_at[kN + 1] = {};
-			u16 used[kN + 1] = {};
+			u32 used[kN + 1] = {};
 			// statistics of the current pattern
 			u32 rollbacks = 0, resim_frames = 0, max_depth = 0, saves = 0, pred_ok = 0, pred_bad = 0;
 			double ms_restore = 0.0, ms_save = 0.0, gt_ms = 0.0;
@@ -644,8 +682,37 @@ namespace Rollback
 				return 0;
 			}
 
+			u32 ReadDevice()
+			{
+				return *reinterpret_cast<const u32*>(eeMem->Main + kDevicePad);
+			}
+
+			void WriteMailbox(u32 slot, u32 word)
+			{
+				*reinterpret_cast<u32*>(eeMem->Main + kMailbox + slot * kMailboxStride) = word;
+			}
+
+			// Writes the guest patch (or restores the original words). Only at the clean point.
+			bool ApplyGuestPatch(bool on)
+			{
+				for (const PatchWord& p : kPatch)
+				{
+					const u32 now = *reinterpret_cast<const u32*>(eeMem->Main + p.addr);
+					const u32 expect = on ? p.original : p.patched;
+					if (now != expect)
+					{
+						Console.Error("RollbackSession: guest word at 0x%06X is 0x%08X, expected 0x%08X: not patching", p.addr, now, expect);
+						return false;
+					}
+				}
+				for (const PatchWord& p : kPatch)
+					*reinterpret_cast<u32*>(eeMem->Main + p.addr) = on ? p.patched : p.original;
+				patched = on;
+				return true;
+			}
+
 			// The input to use for frame f: the true one if it was delivered, else "hold the last known".
-			u16 InputFor(u32 f)
+			u32 InputFor(u32 f)
 			{
 				if (delivered[f])
 					return truth[f];
@@ -657,10 +724,18 @@ namespace Rollback
 				return 0;
 			}
 
+			void ApplyInput(u32 word)
+			{
+				if (mb_mode)
+					WriteMailbox(0, word);
+				else
+					ApplyMask(static_cast<u16>(word));
+			}
+
 			void ApplyUse(u32 f)
 			{
 				used[f] = InputFor(f);
-				ApplyMask(used[f]);
+				ApplyInput(used[f]);
 			}
 
 			bool Active()
@@ -679,6 +754,8 @@ namespace Rollback
 				resim = false;
 				gt_ram.clear();
 				gt_ram.shrink_to_fit();
+				jvs_ram.clear();
+				jvs_ram.shrink_to_fit();
 				rb_ram.clear();
 				rb_ram.shrink_to_fit();
 				s0 = FastSnapshot();
@@ -687,7 +764,8 @@ namespace Rollback
 					s.snap = FastSnapshot();
 					s.valid = false;
 				}
-				Console.WriteLn("RollbackSession: finished (%s): %u PASS / %u FAIL (session vs ground truth)", why, s_pass, s_fail);
+				Console.WriteLn("RollbackSession: finished (%s): %u PASS / %u FAIL (session vs ground truth)%s", why, s_pass, s_fail,
+					patched ? " [WARNING: the guest patch is still applied]" : "");
 			}
 
 			void RequestAct(Act a)
@@ -786,8 +864,33 @@ namespace Rollback
 				pat++;
 				if (pat < static_cast<u32>(std::size(kPatterns)))
 					StartPattern();
+				else if (mb_mode)
+					RequestAct(Act::Cleanup);
 				else
 					Finish("done");
+			}
+
+			// The mailbox ground truth is done: compare it with the JVS ground truth.
+			void CompareMailboxGt()
+			{
+				CopyRam(gt_ram);
+				const DiffResult d = Diff(jvs_ram, gt_ram);
+				u32 pad_lines = 0; // differing lines inside the guest's pad arrays / pad driver structures
+				for (const auto& r : d.ranges)
+				{
+					for (u32 a = r.first; a < r.second; a += 64)
+					{
+						if (a >= 0x5E8A00 && a < 0x5E8D00)
+							pad_lines++;
+					}
+				}
+				Console.WriteLn("RollbackSession: mailbox equivalence: JVS-driven run vs mailbox-driven run (the mailbox run had NO JVS input): "
+								"differing 64B lines: game area %u (of which in the pad structures 0x5E8A00-0x5E8D00: at most %u), EE kernel area %u, volatile ignored=%u",
+					d.lines - d.kernel, pad_lines, d.kernel, d.ignored);
+				if (d.lines != 0)
+					LogCompare("mailbox run vs JVS run", jvs_ram, gt_ram, -1);
+				pat = 0;
+				StartPattern();
 			}
 
 			void RunHook()
@@ -828,17 +931,53 @@ namespace Rollback
 				if (step == Step::Gt)
 				{
 					n++;
-					ApplyMask((n < kN) ? truth[n] : 0);
+					// The pad word the guest used for frame n-1 is in its pad driver structure now.
+					if (want_mailbox && n >= 1)
+						devw[n - 1] = ReadDevice();
+					ApplyMask((n < kN) ? jvs_truth[n] : 0);
 					if (n < kN)
 						return;
 					gt_ms = wall.GetTimeMilliseconds();
+					if (want_mailbox)
+					{
+						CopyRam(jvs_ram);
+						RequestAct(Act::RestoreGt2);
+						return;
+					}
 					CopyRam(gt_ram);
 					pat = 0;
 					StartPattern();
 					return;
 				}
+				if (step == Step::GtMb)
+				{
+					n++;
+					if (n < kN)
+					{
+						WriteMailbox(0, truth[n]);
+						return;
+					}
+					CompareMailboxGt();
+					return;
+				}
 				if (step == Step::Run)
 					RunHook();
+			}
+
+			void ResetPatternState()
+			{
+				for (u32 f = 0; f <= kN; f++)
+				{
+					delivered[f] = false;
+					deliver_at[f] = f + Delay(kPatterns[pat], f);
+					used[f] = 0;
+				}
+				for (Slot& s : ring)
+					s.valid = false;
+				rollbacks = resim_frames = max_depth = saves = pred_ok = pred_bad = 0;
+				ms_restore = ms_save = 0.0;
+				n = 0;
+				resim = false;
 			}
 
 			// Runs at the clean point. Returns true when a session action was handled.
@@ -862,9 +1001,18 @@ namespace Rollback
 					case Act::Init:
 					{
 						MeasureRamUse();
+						if (want_mailbox && RamSize() < kMailbox + 4 * kMailboxStride)
+						{
+							Console.Error("RollbackSession: the mailbox address 0x%X is outside the exposed EE RAM (%u MB)", kMailbox, RamSize() >> 20);
+							Finish("no mailbox");
+							return true;
+						}
+						mb_mode = false;
 						for (u32 f = 0; f <= kN; f++)
 						{
-							truth[f] = (f == 0 || f >= kN) ? 0 : HashMask(f);
+							jvs_truth[f] = (f == 0 || f >= kN) ? 0 : HashMask(f);
+							truth[f] = jvs_truth[f];
+							devw[f] = 0;
 							delivered[f] = false;
 							deliver_at[f] = 0;
 							used[f] = 0;
@@ -883,8 +1031,48 @@ namespace Rollback
 						n = 0;
 						step = Step::Gt;
 						wall.Reset();
-						Console.WriteLn("RollbackSession: begin. %u frames per run, snapshot every %u frames (ring %u), %u delay patterns",
-							kN, kK, kRing, static_cast<u32>(std::size(kPatterns)));
+						Console.WriteLn("RollbackSession: begin (%s). %u frames per run, snapshot every %u frames (ring %u), %u delay patterns",
+							want_mailbox ? "mailbox inputs" : "JVS inputs", kN, kK, kRing, static_cast<u32>(std::size(kPatterns)));
+						break;
+					}
+					case Act::RestoreGt2:
+					{
+						if (!SaveState_FastLoad(s0, FastLoadMode::Diff, false, nullptr, &error))
+						{
+							Console.Error("RollbackSession: S0 restore failed: %s", error.GetDescription().c_str());
+							Finish("restore failed");
+							return true;
+						}
+						// Log the word format the guest's pad driver produced, as a reference for the design memo.
+						{
+							u32 shown = 0;
+							u32 last = 0xFFFFFFFFu;
+							for (u32 f = 0; f < kN && shown < 8; f++)
+							{
+								if (devw[f] != last)
+								{
+									Console.WriteLn("RollbackSession:   pad word of frame %u: 0x%08X (JVS mask 0x%04X)", f, devw[f], jvs_truth[f]);
+									last = devw[f];
+									shown++;
+								}
+							}
+						}
+						if (!ApplyGuestPatch(true))
+						{
+							Finish("patch failed");
+							return true;
+						}
+						mb_mode = true;
+						for (u32 f = 0; f <= kN; f++)
+						{
+							truth[f] = devw[f];
+							used[f] = 0;
+						}
+						ApplyMask(0); // the JVS stays idle: the units read the mailbox
+						WriteMailbox(0, truth[0]);
+						n = 0;
+						step = Step::GtMb;
+						wall.Reset();
 						break;
 					}
 					case Act::Restore0:
@@ -895,21 +1083,29 @@ namespace Rollback
 							Finish("restore failed");
 							return true;
 						}
-						for (u32 f = 0; f <= kN; f++)
+						ResetPatternState();
+						if (mb_mode)
 						{
-							delivered[f] = false;
-							deliver_at[f] = f + Delay(kPatterns[pat], f);
-							used[f] = 0;
+							// S0 holds the original guest code: patch again, and take the frame-0 snapshot after that.
+							if (!ApplyGuestPatch(true))
+							{
+								Finish("patch failed");
+								return true;
+							}
+							ring[0].snap.ee_regions = s_regions;
+							if (!SaveState_FastSave(ring[0].snap, false, &error))
+							{
+								Console.Error("RollbackSession: frame-0 snapshot failed: %s", error.GetDescription().c_str());
+								Finish("save failed");
+								return true;
+							}
 						}
-						for (Slot& s : ring)
-							s.valid = false;
-						ring[0].snap = s0; // frame 0 is the first snapshot
+						else
+						{
+							ring[0].snap = s0; // frame 0 is the first snapshot
+						}
 						ring[0].frame = 0;
 						ring[0].valid = true;
-						rollbacks = resim_frames = max_depth = saves = pred_ok = pred_bad = 0;
-						ms_restore = ms_save = 0.0;
-						n = 0;
-						resim = false;
 						step = Step::Run;
 						ApplyUse(0);
 						wall.Reset();
@@ -946,6 +1142,13 @@ namespace Rollback
 						ApplyUse(n); // start of frame n with its (possibly corrected) input
 						break;
 					}
+					case Act::Cleanup:
+					{
+						ApplyGuestPatch(false);
+						mb_mode = false;
+						Finish("done");
+						break;
+					}
 					case Act::None:
 						break;
 				}
@@ -968,7 +1171,18 @@ namespace Rollback
 		if (s_phase == Phase::Idle && !sess::Active())
 		{
 			sess::requested = true;
-			Console.WriteLn("RollbackSession: requested; starts at the next frame boundary");
+			sess::want_mailbox = false;
+			Console.WriteLn("RollbackSession: requested (JVS inputs); starts at the next frame boundary");
+		}
+	}
+
+	void RequestMailboxTest()
+	{
+		if (s_phase == Phase::Idle && !sess::Active())
+		{
+			sess::requested = true;
+			sess::want_mailbox = true;
+			Console.WriteLn("RollbackSession: requested (mailbox inputs); starts at the next frame boundary");
 		}
 	}
 

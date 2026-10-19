@@ -366,4 +366,9 @@ DEFINE_HOTKEY("RollbackSessionTest", TRANSLATE_NOOP("Hotkeys", "System"), TRANSL
 		if (!pressed && VMManager::HasValidVM())
 			Rollback::RequestSessionTest();
 	})
+DEFINE_HOTKEY("RollbackMailboxTest", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Rollback Mailbox Test (guest input patch)"),
+	[](s32 pressed) {
+		if (!pressed && VMManager::HasValidVM())
+			Rollback::RequestMailboxTest();
+	})
 END_HOTKEY_LIST()

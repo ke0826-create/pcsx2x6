@@ -26,6 +26,10 @@ namespace Rollback
 	/// Arms the late-input rollback session test (F11); it starts at the next frame boundary.
 	void RequestSessionTest();
 
+	/// Arms the mailbox-input rollback session test (F12): the guest's human-unit input reader is patched to read
+	/// its pad word from an emulator-owned mailbox; the test then runs the late-input rollback loop through it.
+	void RequestMailboxTest();
+
 	/// True while a self-test is in progress.
 	bool IsSelfTestRunning();
 } // namespace Rollback

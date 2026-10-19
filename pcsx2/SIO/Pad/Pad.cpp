@@ -262,6 +262,7 @@ void Pad::SetDefaultHotkeyConfig(SettingsInterface& si)
 	si.SetStringValue("Hotkeys", "HoldTurbo", "Keyboard/Period");
 	si.SetStringValue("Hotkeys", "RollbackSelfTest", "Keyboard/F10");
 	si.SetStringValue("Hotkeys", "RollbackSessionTest", "Keyboard/F11");
+	si.SetStringValue("Hotkeys", "RollbackMailboxTest", "Keyboard/F12");
 }
 
 static const Pad::ControllerInfo* s_controller_info[] = {
