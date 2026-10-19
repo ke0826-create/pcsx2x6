@@ -217,6 +217,7 @@ namespace Rollback
 		{
 			u32 lines = 0;   // differing 64-byte lines (volatile line excluded)
 			u32 ignored = 0; // differing lines inside the known volatile range
+			u32 kernel = 0;  // of `lines`: those below the ELF load address 0x100000 (EE kernel / BIOS area)
 			std::vector<std::pair<u32, u32>> ranges;
 		};
 
@@ -235,6 +236,8 @@ namespace Rollback
 					continue;
 				}
 				r.lines++;
+				if (begin < 0x100000)
+					r.kernel++;
 				if (!r.ranges.empty() && begin - r.ranges.back().second <= 256)
 					r.ranges.back().second = begin + 64;
 				else
@@ -539,7 +542,7 @@ namespace Rollback
 		// The clean point rule is the same as in the other test: only OnExecutionExit() saves or loads.
 		namespace sess
 		{
-			constexpr u32 kN = 360;   // frames per run
+			constexpr u32 kN = 720;   // frames per run
 			constexpr u32 kK = 4;     // snapshot interval
 			constexpr u32 kRing = 5;  // snapshots kept (covers about kK * kRing frames)
 			constexpr u32 kNone = 0xFFFFFFFFu;
@@ -559,6 +562,7 @@ namespace Rollback
 			};
 
 			constexpr Pattern kPatterns[] = {
+				{Pat::Fixed, 0, "on time (snapshots only, no rollbacks)"},
 				{Pat::Fixed, 3, "fixed delay 3"},
 				{Pat::Fixed, 8, "fixed delay 8"},
 				{Pat::Jitter, 10, "jitter 0-10"},
@@ -768,13 +772,14 @@ namespace Rollback
 				CopyRam(rb_ram);
 				const DiffResult d = Diff(gt_ram, rb_ram);
 				const double session_ms = wall.GetTimeMilliseconds();
-				if (d.lines == 0)
+				const u32 game_lines = d.lines - d.kernel;
+				if (game_lines == 0)
 					s_pass++;
 				else
 					s_fail++;
-				Console.WriteLn("RollbackSession: [%u/%u] '%s': %s (differing 64B lines=%u, volatile ignored=%u) | predictions right %u / wrong %u | "
+				Console.WriteLn("RollbackSession: [%u/%u] '%s': %s (differing 64B lines: game area %u, EE kernel area <0x100000 %u, volatile ignored=%u) | predictions right %u / wrong %u | "
 								"rollbacks=%u, frames re-simulated=%u (deepest %u), snapshots taken=%u | %u frames in %.0f ms (ground truth %.0f ms), restores %.1f ms, saves %.1f ms",
-					pat + 1, static_cast<u32>(std::size(kPatterns)), kPatterns[pat].name, (d.lines == 0) ? "MATCH" : "DIFFER", d.lines, d.ignored,
+					pat + 1, static_cast<u32>(std::size(kPatterns)), kPatterns[pat].name, (game_lines == 0) ? "MATCH" : "DIFFER", game_lines, d.kernel, d.ignored,
 					pred_ok, pred_bad, rollbacks, resim_frames, max_depth, saves, kN, session_ms, gt_ms, ms_restore, ms_save);
 				if (d.lines != 0)
 					LogCompare("session vs ground truth", gt_ram, rb_ram, -1);
