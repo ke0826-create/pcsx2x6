@@ -1155,6 +1155,270 @@ namespace Rollback
 				return true;
 			}
 		} // namespace sess
+
+		// ======================================================================================
+		// Net battle test: mailbox inputs + stopping the game's own comm module during a battle
+		// ======================================================================================
+		// For the multi-emulator (nettest) setup. It is driven from outside through a control block in EE RAM
+		// (kCtrl, in the extra RAM above the mailbox), written by a script over PINE, so that every emulator can
+		// be switched at the SAME logical frame: the script writes absolute battle frame numbers (BF).
+		//
+		//   G1 (cmd bit 0): from BF >= TARGET_G1 the human units read the mailbox (the 4-word guest patch of the
+		//                   F12 test). Every hook writes the words of all slots for the frame about to run; the
+		//                   words are a pure function of (slot, BF), so every emulator writes the same ones.
+		//   G2 (cmd bit 1): from BF >= TARGET_G2 the per-frame call of the comm step in the battle main loop
+		//                   (0x1DCF84: jal 0x2F9A10) is replaced by "addiu v0,zero,1", i.e. the game believes the
+		//                   inputs of all machines are always there and never waits for the network.
+		//   cmd = 0       : revert both (at the clean point).
+		//
+		// Every hook after G1 also logs "NetBattle: BF=<frame> h=<hash of the unit structures> ..." so that the
+		// logs of the emulators can be compared frame by frame afterwards. The first G1 decision logs a census of
+		// the units and of the game context (human/CPU flags, slot numbers) for the design memo.
+		namespace nb
+		{
+			constexpr u32 kCtrl = 0x2000F00;
+			constexpr u32 kGpBase = 0x4A8370;
+			constexpr u32 kUnitPtrs = 0x5E8F30;
+			constexpr u32 kUnitSize = 0x4A90;
+			constexpr u32 kG2Addr = 0x1DCF84;
+			constexpr u32 kG2Original = 0x0C0BE684; // jal 0x2F9A10
+			constexpr u32 kG2Patched = 0x24020001;   // addiu v0,zero,1
+			constexpr u32 kLogFrames = 2400;
+			constexpr u32 kSlotsWritten = 6;
+
+			// words of the control block
+			constexpr u32 CMD = 0, TARGET_G1 = 1, TARGET_G2 = 2, STATUS = 3, BF_G1 = 4, BF_G2 = 5, LOGGED = 6, HEARTBEAT = 7;
+			// STATUS: 0 idle, 1 waiting for a battle, 2 G1 applied, 3 G1+G2 applied, 0x10 patch refused, 0x11 RAM too small
+
+			bool g1 = false;
+			bool g2 = false;
+			u32 pend = 0; // 1 = apply G1, 2 = apply G2, 3 = revert
+			u32 logged = 0;
+
+			u32 R32(u32 a)
+			{
+				return *reinterpret_cast<const u32*>(eeMem->Main + a);
+			}
+			u8 R8(u32 a)
+			{
+				return eeMem->Main[a];
+			}
+			void W32(u32 a, u32 v)
+			{
+				*reinterpret_cast<u32*>(eeMem->Main + a) = v;
+			}
+			float RF(u32 a)
+			{
+				float f;
+				std::memcpy(&f, eeMem->Main + a, sizeof(f));
+				return f;
+			}
+			bool Plausible(u32 p)
+			{
+				return p >= 0x100000 && p < 0x2000000;
+			}
+
+			// Battle frame counter BF = *(*(gp-0x7D10)+0xC); false while the pointer chain is not valid.
+			bool ReadBf(u32* bf)
+			{
+				const u32 p = R32(kGpBase - 0x7D10);
+				if (!Plausible(p))
+					return false;
+				*bf = R32(p + 0xC);
+				return true;
+			}
+
+			// Active unit structures (their attack table pointer at +0x2E8 is set).
+			u32 Units(u32* ptrs)
+			{
+				u32 n = 0;
+				for (u32 k = 0; k < 8; k++)
+				{
+					const u32 p = R32(kUnitPtrs + 4 * k);
+					ptrs[k] = 0;
+					if (Plausible(p) && R32(p + 0x2E8) != 0)
+					{
+						ptrs[k] = p;
+						n++;
+					}
+				}
+				return n;
+			}
+
+			u32 NbWord(u32 slot, u32 bf)
+			{
+				static constexpr u32 kWords[8] = {0x00, 0xBF, 0x9D, 0x57, 0x61, 0xA9, 0x8B, 0x45};
+				return kWords[(bf / 6 + slot * 5) % 8];
+			}
+
+			u64 HashUnits(const u32* ptrs)
+			{
+				u64 h = 1469598103934665603ull;
+				for (u32 k = 0; k < 8; k++)
+				{
+					if (!ptrs[k])
+						continue;
+					const u64* w = reinterpret_cast<const u64*>(eeMem->Main + ptrs[k]);
+					for (u32 i = 0; i < kUnitSize / 8; i++)
+						h = (h ^ w[i]) * 1099511628211ull;
+				}
+				return h;
+			}
+
+			void LogCensus(u32 bf, const u32* ptrs)
+			{
+				const u32 ctx = R32(kGpBase - 0x7D20);
+				if (Plausible(ctx))
+				{
+					Console.WriteLn("NetBattle: census at BF=%u: ctx=0x%X (+0x1D=%u +0x1F=%u +0x27=%u +0xCA=%u); comm: my slot(0x6302BE)=%u, C=%u, D=%u",
+						bf, ctx, R8(ctx + 0x1D), R8(ctx + 0x1F), R8(ctx + 0x27), R8(ctx + 0xCA), R8(0x6302BE), R8(0x6302BF), R8(0x6302C2));
+				}
+				for (u32 k = 0; k < 8; k++)
+				{
+					const u32 p = R32(kUnitPtrs + 4 * k);
+					if (!Plausible(p))
+						continue;
+					Console.WriteLn("NetBattle:   unit[%u] @0x%X %s slot(+6)=%u +5=%u +9=%u +0xA=%u +0xD=%u id=0x%X atk=0x%X +0x4D4=0x%X hp=%.0f",
+						k, p, ptrs[k] ? "active" : "inactive", R8(p + 6), R8(p + 5), R8(p + 9), R8(p + 0xA), R8(p + 0xD),
+						R32(p + 8) & 0xFFFF, R32(p + 0x2E8), R8(p + 0x4D4), RF(p + 0x1F4));
+				}
+				for (u32 s = 0; s < 6; s++)
+				{
+					const u32 b = 0x5E8A70 + s * 0x40;
+					Console.WriteLn("NetBattle:   pad array[%u]: cur=0x%X prev=0x%X pressed=0x%X", s, R32(b), R32(b + 4), R32(b + 8));
+				}
+			}
+
+			bool ApplyG2(bool on)
+			{
+				u32* w = reinterpret_cast<u32*>(eeMem->Main + kG2Addr);
+				const u32 expect = on ? kG2Original : kG2Patched;
+				if (*w != expect)
+				{
+					Console.Error("NetBattle: guest word at 0x%06X is 0x%08X, expected 0x%08X: not patching", kG2Addr, *w, expect);
+					return false;
+				}
+				*w = on ? kG2Patched : kG2Original;
+				return true;
+			}
+
+			void RequestExit(u32 what)
+			{
+				pend = what;
+				Cpu->ExitExecution();
+			}
+
+			void OnHook()
+			{
+				if (RamSize() < kCtrl + 0x40)
+					return;
+				const u32 cmd = R32(kCtrl + CMD * 4);
+				if (cmd == 0 && !g1 && !g2)
+					return; // nothing armed: one read per frame
+				W32(kCtrl + HEARTBEAT * 4, R32(kCtrl + HEARTBEAT * 4) + 1);
+
+				if (cmd == 0)
+				{
+					RequestExit(3);
+					return;
+				}
+
+				u32 ptrs[8];
+				const u32 nu = Units(ptrs);
+				u32 bf = 0;
+				const bool battle = ReadBf(&bf) && nu >= 2;
+				if (!battle)
+				{
+					if (!g1)
+						W32(kCtrl + STATUS * 4, 1);
+					return;
+				}
+
+				if (cmd & 1)
+				{
+					// The words for the frame about to run; harmless while the guest is not patched yet.
+					for (u32 s = 0; s < kSlotsWritten; s++)
+						sess::WriteMailbox(s, NbWord(s, bf));
+					if (!g1 && bf >= R32(kCtrl + TARGET_G1 * 4))
+					{
+						LogCensus(bf, ptrs);
+						RequestExit(1);
+						return;
+					}
+				}
+				if ((cmd & 2) && g1 && !g2 && bf >= R32(kCtrl + TARGET_G2 * 4))
+				{
+					RequestExit(2);
+					return;
+				}
+
+				if (g1 && logged < kLogFrames)
+				{
+					u32 first = 0;
+					for (u32 k = 0; k < 8 && !first; k++)
+						first = ptrs[k];
+					Console.WriteLn("NetBattle: BF=%u h=%016llx p0=%.2f,%.2f,%.2f hp0=%.0f g2=%u", bf,
+						static_cast<unsigned long long>(HashUnits(ptrs)), first ? RF(first + 0x60) : 0.0f, first ? RF(first + 0x64) : 0.0f,
+						first ? RF(first + 0x68) : 0.0f, first ? RF(first + 0x1F4) : 0.0f, g2 ? 1u : 0u);
+					logged++;
+					W32(kCtrl + LOGGED * 4, logged);
+				}
+			}
+
+			// Runs at the clean point. Returns true when a net battle action was handled.
+			bool OnExit()
+			{
+				if (pend == 0)
+					return false;
+				const u32 what = pend;
+				pend = 0;
+				if (!VMManager::HasValidVM() || VMManager::GetState() != VMState::Running)
+					return true;
+
+				u32 bf = 0;
+				ReadBf(&bf);
+				if (what == 1)
+				{
+					if (sess::ApplyGuestPatch(true))
+					{
+						g1 = true;
+						W32(kCtrl + BF_G1 * 4, bf);
+						W32(kCtrl + STATUS * 4, 2);
+						Console.WriteLn("NetBattle: G1 applied (human units read the mailbox) at BF=%u", bf);
+					}
+					else
+					{
+						W32(kCtrl + STATUS * 4, 0x10);
+					}
+				}
+				else if (what == 2)
+				{
+					if (ApplyG2(true))
+					{
+						g2 = true;
+						W32(kCtrl + BF_G2 * 4, bf);
+						W32(kCtrl + STATUS * 4, 3);
+						Console.WriteLn("NetBattle: G2 applied (the battle loop no longer calls the comm step) at BF=%u", bf);
+					}
+					else
+					{
+						W32(kCtrl + STATUS * 4, 0x10);
+					}
+				}
+				else
+				{
+					if (g2)
+						ApplyG2(false);
+					if (g1)
+						sess::ApplyGuestPatch(false);
+					g1 = g2 = false;
+					logged = 0;
+					W32(kCtrl + STATUS * 4, 0);
+					Console.WriteLn("NetBattle: reverted at BF=%u", bf);
+				}
+				return true;
+			}
+		} // namespace nb
 	} // namespace
 
 	void RequestSelfTest()
@@ -1215,6 +1479,7 @@ namespace Rollback
 
 		if (s_phase == Phase::Idle)
 		{
+			nb::OnHook();
 			if (s_requested)
 			{
 				if (VMManager::HasValidVM())
@@ -1264,6 +1529,8 @@ namespace Rollback
 	void OnExecutionExit()
 	{
 		if (sess::OnExit())
+			return;
+		if (nb::OnExit())
 			return;
 		if (s_pending == Pending::None)
 			return;
