@@ -19,6 +19,7 @@
 #include "SIO/Sio.h"
 #include "SPU2/spu2.h"
 #include "Recording/InputRecording.h"
+#include "Rollback.h"
 #include "VMManager.h"
 #include "VUmicro.h"
 
@@ -500,6 +501,9 @@ static __fi void VSyncStart(u64 sCycle)
 
 	// Poll input after MTGS frame push, just in case it has to stall to catch up.
 	VMManager::Internal::PollInputOnCPUThread();
+
+	// Rollback netplay groundwork (offline self-test). One branch when idle.
+	Rollback::OnVSync();
 
 	EECNT_LOG("    ================  EE COUNTER VSYNC START (frame: %d)  ================", g_FrameCount);
 

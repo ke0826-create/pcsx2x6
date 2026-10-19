@@ -102,6 +102,7 @@ set(pcsx2Sources
 	R5900.cpp
 	R5900OpcodeImpl.cpp
 	R5900OpcodeTables.cpp
+	Rollback.cpp
 	SaveState.cpp
 	ShiftJisToUnicode.cpp
 	Sif.cpp
@@ -179,6 +180,7 @@ set(pcsx2Headers
 	R3000A.h
 	R5900.h
 	R5900OpcodeTables.h
+	Rollback.h
 	SaveState.h
 	ShaderCacheVersion.h
 	Sifcmd.h

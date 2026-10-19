@@ -9,6 +9,7 @@
 #include "ImGui/ImGuiOverlays.h"
 #include "Input/InputManager.h"
 #include "Recording/InputRecording.h"
+#include "Rollback.h"
 #include "SPU2/spu2.h"
 #include "VMManager.h"
 #include "SIO/Memcard/MemoryCardFile.h"
@@ -354,5 +355,10 @@ DEFINE_HOTKEY("ToggleMouseLock", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_
 	[](s32 pressed) {
 		if (!pressed)
 			Host::SetMouseLock(!Host::GetBoolSettingValue("EmuCore", "EnableMouseLock"));
+	})
+DEFINE_HOTKEY("RollbackSelfTest", TRANSLATE_NOOP("Hotkeys", "System"), TRANSLATE_NOOP("Hotkeys", "Rollback Self-Test (offline)"),
+	[](s32 pressed) {
+		if (!pressed && VMManager::HasValidVM())
+			Rollback::RequestSelfTest();
 	})
 END_HOTKEY_LIST()
