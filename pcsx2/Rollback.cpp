@@ -1159,9 +1159,9 @@ namespace Rollback
 		// ======================================================================================
 		// Net battle test: mailbox inputs + stopping the game's own comm module during a battle
 		// ======================================================================================
-		// For the multi-emulator (nettest) setup. It is driven from outside through a control block in EE RAM
-		// (kCtrl, in the extra RAM above the mailbox), written by a script over PINE, so that every emulator can
-		// be switched at the SAME logical frame: the script writes absolute battle frame numbers (BF).
+		// For the multi-emulator (nettest) setup. It is driven from outside through the file nb_ctrl.txt in the
+		// emulator's working directory ("<cmd> <targetG1> <targetG2>", status in nb_status.txt), so that every
+		// emulator can be switched at the SAME logical frame: the script writes absolute battle frame numbers (BF).
 		//
 		//   G1 (cmd bit 0): from BF >= TARGET_G1 the human units read the mailbox (the 4-word guest patch of the
 		//                   F12 test). Every hook writes the words of all slots for the frame about to run; the
@@ -1176,7 +1176,6 @@ namespace Rollback
 		// the units and of the game context (human/CPU flags, slot numbers) for the design memo.
 		namespace nb
 		{
-			constexpr u32 kCtrl = 0x2000F00;
 			constexpr u32 kGpBase = 0x4A8370;
 			constexpr u32 kUnitPtrs = 0x5E8F30;
 			constexpr u32 kUnitSize = 0x4A90;
@@ -1186,9 +1185,52 @@ namespace Rollback
 			constexpr u32 kLogFrames = 2400;
 			constexpr u32 kSlotsWritten = 6;
 
-			// words of the control block
+			// words of the control block (kept in the emulator, not in guest RAM: PINE cannot address the RAM above 32 MB)
 			constexpr u32 CMD = 0, TARGET_G1 = 1, TARGET_G2 = 2, STATUS = 3, BF_G1 = 4, BF_G2 = 5, LOGGED = 6, HEARTBEAT = 7;
 			// STATUS: 0 idle, 1 waiting for a battle, 2 G1 applied, 3 G1+G2 applied, 0x10 patch refused, 0x11 RAM too small
+
+			u32 ctl[8] = {};
+			bool dirty = false;
+			u32 polls = 0;
+
+			void SetCtl(u32 k, u32 v)
+			{
+				if (ctl[k] != v)
+				{
+					ctl[k] = v;
+					dirty = true;
+				}
+			}
+
+			// "nb_ctrl.txt" in the working directory: "<cmd> <targetG1> <targetG2>", polled every 15 frames.
+			// "nb_status.txt" is rewritten whenever the status words change.
+			void PollControlFile()
+			{
+				if (polls++ % 15)
+					return;
+				std::FILE* f = std::fopen("nb_ctrl.txt", "r");
+				if (!f)
+					return;
+				unsigned c = 0, t1 = 0, t2 = 0;
+				if (std::fscanf(f, "%u %u %u", &c, &t1, &t2) == 3)
+				{
+					SetCtl(CMD, c);
+					SetCtl(TARGET_G1, t1);
+					SetCtl(TARGET_G2, t2);
+				}
+				std::fclose(f);
+			}
+
+			void WriteStatusFile()
+			{
+				dirty = false;
+				std::FILE* f = std::fopen("nb_status.txt", "w");
+				if (!f)
+					return;
+				std::fprintf(f, "%u %u %u %u %u %u
+", ctl[STATUS], ctl[BF_G1], ctl[BF_G2], ctl[LOGGED], ctl[CMD], ctl[HEARTBEAT]);
+				std::fclose(f);
+			}
 
 			bool g1 = false;
 			bool g2 = false;
@@ -1310,12 +1352,18 @@ namespace Rollback
 
 			void OnHook()
 			{
-				if (RamSize() < kCtrl + 0x40)
-					return;
-				const u32 cmd = R32(kCtrl + CMD * 4);
+				PollControlFile();
+				if (dirty)
+					WriteStatusFile();
+				const u32 cmd = ctl[CMD];
 				if (cmd == 0 && !g1 && !g2)
-					return; // nothing armed: one read per frame
-				W32(kCtrl + HEARTBEAT * 4, R32(kCtrl + HEARTBEAT * 4) + 1);
+					return; // nothing armed
+				if (RamSize() < sess::kMailbox + kSlotsWritten * sess::kMailboxStride)
+				{
+					SetCtl(STATUS, 0x11);
+					return;
+				}
+				ctl[HEARTBEAT]++;
 
 				if (cmd == 0)
 				{
@@ -1330,7 +1378,7 @@ namespace Rollback
 				if (!battle)
 				{
 					if (!g1)
-						W32(kCtrl + STATUS * 4, 1);
+						SetCtl(STATUS, 1);
 					return;
 				}
 
@@ -1339,14 +1387,14 @@ namespace Rollback
 					// The words for the frame about to run; harmless while the guest is not patched yet.
 					for (u32 s = 0; s < kSlotsWritten; s++)
 						sess::WriteMailbox(s, NbWord(s, bf));
-					if (!g1 && bf >= R32(kCtrl + TARGET_G1 * 4))
+					if (!g1 && bf >= ctl[TARGET_G1])
 					{
 						LogCensus(bf, ptrs);
 						RequestExit(1);
 						return;
 					}
 				}
-				if ((cmd & 2) && g1 && !g2 && bf >= R32(kCtrl + TARGET_G2 * 4))
+				if ((cmd & 2) && g1 && !g2 && bf >= ctl[TARGET_G2])
 				{
 					RequestExit(2);
 					return;
@@ -1361,7 +1409,7 @@ namespace Rollback
 						static_cast<unsigned long long>(HashUnits(ptrs)), first ? RF(first + 0x60) : 0.0f, first ? RF(first + 0x64) : 0.0f,
 						first ? RF(first + 0x68) : 0.0f, first ? RF(first + 0x1F4) : 0.0f, g2 ? 1u : 0u);
 					logged++;
-					W32(kCtrl + LOGGED * 4, logged);
+					ctl[LOGGED] = logged;
 				}
 			}
 
@@ -1382,13 +1430,13 @@ namespace Rollback
 					if (sess::ApplyGuestPatch(true))
 					{
 						g1 = true;
-						W32(kCtrl + BF_G1 * 4, bf);
-						W32(kCtrl + STATUS * 4, 2);
+						SetCtl(BF_G1, bf);
+						SetCtl(STATUS, 2);
 						Console.WriteLn("NetBattle: G1 applied (human units read the mailbox) at BF=%u", bf);
 					}
 					else
 					{
-						W32(kCtrl + STATUS * 4, 0x10);
+						SetCtl(STATUS, 0x10);
 					}
 				}
 				else if (what == 2)
@@ -1396,13 +1444,13 @@ namespace Rollback
 					if (ApplyG2(true))
 					{
 						g2 = true;
-						W32(kCtrl + BF_G2 * 4, bf);
-						W32(kCtrl + STATUS * 4, 3);
+						SetCtl(BF_G2, bf);
+						SetCtl(STATUS, 3);
 						Console.WriteLn("NetBattle: G2 applied (the battle loop no longer calls the comm step) at BF=%u", bf);
 					}
 					else
 					{
-						W32(kCtrl + STATUS * 4, 0x10);
+						SetCtl(STATUS, 0x10);
 					}
 				}
 				else
@@ -1413,7 +1461,7 @@ namespace Rollback
 						sess::ApplyGuestPatch(false);
 					g1 = g2 = false;
 					logged = 0;
-					W32(kCtrl + STATUS * 4, 0);
+					SetCtl(STATUS, 0);
 					Console.WriteLn("NetBattle: reverted at BF=%u", bf);
 				}
 				return true;
