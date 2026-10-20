@@ -1800,6 +1800,26 @@ namespace Rollback
 				Console.WriteLn("RbNet: EE write watch on: %u ranges", static_cast<u32>(watch_ranges.size()));
 			}
 
+			// a load of the guest at `pc` (logged without a range filter; the value is read from RAM before the load)
+			void WatchRead(u32 addr, u32 size, u32 pc)
+			{
+				if (!watch_file || (addr & 0x1FFFFFFFu) + 8 >= 0x2000000u)
+					return;
+				if (watch_lines++ > 800000u)
+					return;
+				u64 v = 0;
+				std::memcpy(&v, eeMem->Main + (addr & 0x1FFFFFFFu), size > 8 ? 8 : size);
+				u32 bf = 0;
+				u32 p = 0;
+				std::memcpy(&p, eeMem->Main + (0x4A8370u - 0x7D10u), 4);
+				if (p > 0x100000u && p < 0x2000000u)
+					std::memcpy(&bf, eeMem->Main + p + 0xC, 4);
+				const double t = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() / 1000.0;
+				std::fprintf(watch_file, "%.3f BF=%u PC=%08X R=%08X S=%u V=%llX\n", t, bf, pc, addr & 0x1FFFFFFFu, size, static_cast<unsigned long long>(v));
+				if ((watch_lines & 63u) == 0)
+					std::fflush(watch_file);
+			}
+
 			void WatchWrite(u32 addr, u32 size, u64 val, u32 pc)
 			{
 				addr &= 0x1FFFFFFFu;
@@ -2895,8 +2915,14 @@ namespace Rollback
 			case 0x3F: size = 8; v = cpuRegs.GPR.r[rt].UD[0]; break; // SD
 			case 0x1F: size = 16; v = cpuRegs.GPR.r[rt].UD[0]; break; // SQ
 			case 0x39: size = 4; v = fpuRegs.fpr[rt].UL; break; // SWC1
+			case 0x20: case 0x24: rn::WatchRead(addr, 1, pc); return; // LB / LBU
+			case 0x21: case 0x25: rn::WatchRead(addr, 2, pc); return; // LH / LHU
+			case 0x23: case 0x27: rn::WatchRead(addr, 4, pc); return; // LW / LWU
+			case 0x37: rn::WatchRead(addr, 8, pc); return; // LD
 			default: return;
 		}
+		if (pc >= 0x151D60 && pc < 0x151F00)
+			rn::WatchRead(addr, size, pc); // a store in the channel status code: log it as read-style line too
 		rn::WatchWrite(addr, size, v, pc);
 	}
 
