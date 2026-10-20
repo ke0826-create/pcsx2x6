@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <string>
 #include <thread>
@@ -1557,6 +1558,9 @@ namespace Rollback
 				u32 synthetic = 1;
 				u32 start = 0;     // battle frame at which the rollback mode starts (same on all emulators)
 				u32 debug = 0;     // bit 0: take no snapshots, bit 1: never restore (mispredictions are ignored), bit 2: EE-only snapshots (IOP is not rolled back)
+				u32 net_delay = 0;  // simulated one-way network delay of every outgoing packet, ms (can be changed while running)
+				u32 net_jitter = 0; // + a random 0..net_jitter ms
+				u32 net_drop = 0;   // simulated packet loss, percent
 			};
 
 			St st = St::Idle;
@@ -1581,7 +1585,46 @@ namespace Rollback
 			s32 kn[kSlots] = {};
 			// statistics
 			u32 rollbacks = 0, resim_frames = 0, max_depth = 0, saves = 0, pred_ok = 0, pred_bad = 0, stalls = 0, anomalies = 0;
-			u32 pkts_in = 0, pkts_bad = 0, live_frames = 0;
+			u32 pkts_in = 0, pkts_bad = 0, live_frames = 0, pkts_out = 0, pkts_dropped = 0;
+
+			// Outgoing packets wait here until their simulated delivery time.
+			struct Outgoing
+			{
+				std::chrono::steady_clock::time_point due;
+				u16 port;
+				u32 len;
+				Packet p;
+			};
+			std::deque<Outgoing> outq;
+			u32 rng = 12345u;
+
+			u32 Rand()
+			{
+				rng ^= rng << 13;
+				rng ^= rng >> 17;
+				rng ^= rng << 5;
+				return rng;
+			}
+
+			// Sends what is due. Cheap when the queue is empty.
+			void FlushSends()
+			{
+				if (outq.empty())
+					return;
+				const auto now = std::chrono::steady_clock::now();
+				for (auto it = outq.begin(); it != outq.end();)
+				{
+					if (it->due <= now)
+					{
+						RollbackNet::SendTo(kPeerIp, it->port, &it->p, static_cast<int>(it->len));
+						it = outq.erase(it);
+					}
+					else
+					{
+						++it;
+					}
+				}
+			}
 			double ms_restore = 0.0, ms_save = 0.0, ms_stall = 0.0;
 
 			bool Active()
@@ -1600,11 +1643,11 @@ namespace Rollback
 				std::FILE* f = std::fopen("rb_net.txt", "r");
 				if (!f)
 					return;
-				unsigned enable = 0, slot = 0, port = 0, delay = 0, synthetic = 0, start = 0, debug = 0;
+				unsigned enable = 0, slot = 0, port = 0, delay = 0, synthetic = 0, start = 0, debug = 0, nd = 0, nj = 0, np = 0;
 				int pattern = -1;
-				const int n = std::fscanf(f, "%u %u %u %u %d %u %u %u", &enable, &slot, &port, &delay, &pattern, &synthetic, &start, &debug);
+				const int n = std::fscanf(f, "%u %u %u %u %d %u %u %u %u %u %u", &enable, &slot, &port, &delay, &pattern, &synthetic, &start, &debug, &nd, &nj, &np);
 				std::fclose(f);
-				if (n != 7 && n != 8)
+				if (n < 7)
 					return;
 				cfg.enable = enable;
 				cfg.slot = slot;
@@ -1613,7 +1656,10 @@ namespace Rollback
 				cfg.pattern = pattern;
 				cfg.synthetic = synthetic;
 				cfg.start = start;
-				cfg.debug = (n == 8) ? debug : 0;
+				cfg.debug = (n >= 8) ? debug : 0;
+				cfg.net_delay = (n >= 9) ? nd : 0;
+				cfg.net_jitter = (n >= 10) ? nj : 0;
+				cfg.net_drop = (n >= 11) ? np : 0;
 			}
 
 			// Idle: look for the config file every kPollEvery vsyncs.
@@ -1637,8 +1683,9 @@ namespace Rollback
 			void LogStats(const char* tag)
 			{
 				Console.WriteLn("RbNet: %s: live frames %u, rollbacks %u (frames re-simulated %u, deepest %u), predictions right %u / wrong %u, "
-								"stalls %u (%.0f ms), snapshots %u, restore %.1f ms total, save %.1f ms total, packets in %u (bad %u), BF anomalies %u",
-					tag, live_frames, rollbacks, resim_frames, max_depth, pred_ok, pred_bad, stalls, ms_stall, saves, ms_restore, ms_save, pkts_in, pkts_bad, anomalies);
+								"stalls %u (%.0f ms), snapshots %u, restore %.1f ms total, save %.1f ms total, packets in %u (bad %u) out %u (dropped %u), BF anomalies %u",
+					tag, live_frames, rollbacks, resim_frames, max_depth, pred_ok, pred_bad, stalls, ms_stall, saves, ms_restore, ms_save, pkts_in, pkts_bad, pkts_out,
+					pkts_dropped, anomalies);
 			}
 
 			void Stop(const char* why)
@@ -1650,6 +1697,7 @@ namespace Rollback
 				resim = false;
 				LogStats(why);
 				RollbackNet::Close();
+				outq.clear();
 				g_FastSkipIop = false;
 				st = St::Idle;
 				act = Act::None;
@@ -1810,11 +1858,30 @@ namespace Rollback
 				p.first = base + static_cast<u32>(first);
 				for (u32 k = 0; k < p.count; k++)
 					p.words[k] = truth[me][static_cast<u32>(first) + k];
+				const bool simulated = cfg.net_delay != 0 || cfg.net_jitter != 0 || cfg.net_drop != 0;
 				for (u32 s = 0; s < kSlots; s++)
 				{
-					if (s != me)
+					if (s == me)
+						continue;
+					pkts_out++;
+					if (cfg.net_drop && (Rand() % 100) < cfg.net_drop)
+					{
+						pkts_dropped++;
+						continue;
+					}
+					if (!simulated)
+					{
 						RollbackNet::SendTo(kPeerIp, static_cast<u16>(cfg.port + s), &p, static_cast<int>(16 + 4 * p.count));
+						continue;
+					}
+					Outgoing o;
+					o.due = std::chrono::steady_clock::now() + std::chrono::microseconds(1000ull * (cfg.net_delay + (cfg.net_jitter ? Rand() % (cfg.net_jitter + 1) : 0)));
+					o.port = static_cast<u16>(cfg.port + s);
+					o.len = 16 + 4 * p.count;
+					o.p = p;
+					outq.push_back(o);
 				}
+				FlushSends();
 			}
 
 			// The state at hook F is final when every used word of the frames before F was a true one.
@@ -1904,6 +1971,7 @@ namespace Rollback
 				{
 					if (F < target)
 					{
+						FlushSends();
 						WriteAll(F);
 						LogVerified(F, ptrs);
 						MaybeSave(F);
@@ -1919,6 +1987,7 @@ namespace Rollback
 					return;
 				}
 
+				FlushSends();
 				PollNet();
 				u32 m = Deliver(F, false);
 				if (m == kNoFrame && Depth(F) > kMaxDepth)
@@ -1933,6 +2002,7 @@ namespace Rollback
 							return;
 						}
 						std::this_thread::sleep_for(std::chrono::milliseconds(1));
+						FlushSends();
 						PollNet();
 						m = Deliver(F, true);
 					}
@@ -1952,20 +2022,32 @@ namespace Rollback
 				live_frames++;
 				if (live_frames % 600 == 0)
 					LogStats("progress");
-				if (live_frames % 60 == 0)
+				if (live_frames % 30 == 0)
 				{
-					// "0 ..." as the first word of rb_net.txt stops the session (the final statistics are logged)
-					std::FILE* f = std::fopen("rb_net.txt", "r");
-					if (f)
+					// rb_net.txt is re-read while running: "0 ..." stops the session (the final statistics are logged); the
+					// artificial-lateness pattern and the simulated network (delay, jitter, loss) can be changed live, because
+					// they only change WHEN inputs become visible, never what the true inputs are.
+					const int old_pattern = cfg.pattern;
+					const u32 od = cfg.net_delay, oj = cfg.net_jitter, op = cfg.net_drop;
+					Cfg saved = cfg;
+					ReadConfig();
+					const bool enabled = cfg.enable != 0;
+					const Cfg now = cfg;
+					cfg = saved;
+					if (!enabled)
 					{
-						unsigned enable = 1;
-						const int n = std::fscanf(f, "%u", &enable);
-						std::fclose(f);
-						if (n == 1 && enable == 0)
-						{
-							Stop("stopped by rb_net.txt");
-							return;
-						}
+						Stop("stopped by rb_net.txt");
+						return;
+					}
+					cfg.pattern = now.pattern;
+					cfg.net_delay = now.net_delay;
+					cfg.net_jitter = now.net_jitter;
+					cfg.net_drop = now.net_drop;
+					if (cfg.pattern != old_pattern || cfg.net_delay != od || cfg.net_jitter != oj || cfg.net_drop != op)
+					{
+						Console.WriteLn("RbNet: settings changed at BF %u: artificial pattern %d, network delay %u ms + jitter %u ms, loss %u%%", F, cfg.pattern,
+							cfg.net_delay, cfg.net_jitter, cfg.net_drop);
+						LogStats("settings");
 					}
 				}
 				MaybeSave(F);
@@ -2038,7 +2120,9 @@ namespace Rollback
 							kn[s] = static_cast<s32>(L) - 1;
 						}
 						rollbacks = resim_frames = max_depth = saves = pred_ok = pred_bad = stalls = anomalies = 0;
-						pkts_in = pkts_bad = live_frames = 0;
+						pkts_in = pkts_bad = live_frames = pkts_out = pkts_dropped = 0;
+						outq.clear();
+						rng = 12345u + me * 7919u;
 						ms_restore = ms_save = ms_stall = 0.0;
 						last_logged = kNoFrame;
 						resim = false;
