@@ -83,6 +83,8 @@ namespace
 			s_freeze_prof->Lap(name); \
 	} while (0)
 
+bool g_FastSkipIop = false;
+
 static void PreLoadPrep()
 {
 	// ensure everything is in sync before we start overwriting stuff.
@@ -220,7 +222,8 @@ bool SaveStateBase::FreezeInternals(Error* error)
 		return false;
 
 	Freeze(cpuRegs);		// cpu regs + COP0
-	Freeze(psxRegs);		// iop regs
+	if (!g_FastSkipIop)
+		Freeze(psxRegs);	// iop regs
 	Freeze(fpuRegs);
 	Freeze(tlb);			// tlbs
 	Freeze(cachedTlbs);		// cached tlbs
@@ -237,8 +240,11 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	Freeze(EEoCycle);
 	Freeze(nextDeltaCounter);
 	Freeze(nextStartCounter);
-	Freeze(psxNextStartCounter);
-	Freeze(psxNextDeltaCounter);
+	if (!g_FastSkipIop)
+	{
+		Freeze(psxNextStartCounter);
+		Freeze(psxNextDeltaCounter);
+	}
 
 	// Fourth Block - EE-related systems
 	// ---------------------------------
@@ -275,53 +281,57 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	if (!FreezeTag("IOP-Subsystems"))
 		return false;
 
-	FreezeMem(iopMem->Sif, sizeof(iopMem->Sif));		// iop's sif memory (not really needed, but oh well)
-
-	okay = okay && psxRcntFreeze();
-
-	// TODO: move all the others over to StateWrapper too...
-	if (!okay)
-		return false;
+	if (!g_FastSkipIop)
 	{
-		// This is horrible. We need to move the rest over...
-		std::optional<StateWrapper::VectorMemoryStream> save_stream;
-		std::optional<StateWrapper::ReadOnlyMemoryStream> load_stream;
-		if (IsSaving())
-			save_stream.emplace();
-		else
-			load_stream.emplace(&m_memory[m_idx], static_cast<int>(m_memory.size()) - m_idx);
+		FreezeMem(iopMem->Sif, sizeof(iopMem->Sif));		// iop's sif memory (not really needed, but oh well)
 
-		StateWrapper sw(IsSaving() ? static_cast<StateWrapper::IStream*>(&save_stream.value()) :
-									 static_cast<StateWrapper::IStream*>(&load_stream.value()),
-			IsSaving() ? StateWrapper::Mode::Write : StateWrapper::Mode::Read, g_SaveVersion);
+		okay = okay && psxRcntFreeze();
 
-		okay = okay && g_Sio0.DoState(sw);
-		okay = okay && g_Sio2.DoState(sw);
-		okay = okay && g_MultitapArr.at(0).DoState(sw);
-		okay = okay && g_MultitapArr.at(1).DoState(sw);
-
-		if (!okay || !sw.IsGood())
+		// TODO: move all the others over to StateWrapper too...
+		if (!okay)
 			return false;
+		{
+			// This is horrible. We need to move the rest over...
+			std::optional<StateWrapper::VectorMemoryStream> save_stream;
+			std::optional<StateWrapper::ReadOnlyMemoryStream> load_stream;
+			if (IsSaving())
+				save_stream.emplace();
+			else
+				load_stream.emplace(&m_memory[m_idx], static_cast<int>(m_memory.size()) - m_idx);
 
-		if (IsSaving())
-		{
-			FreezeMem(const_cast<u8*>(save_stream->GetBuffer().data()), save_stream->GetPosition());
-		}
-		else
-		{
-			const int new_idx = m_idx + static_cast<int>(load_stream->GetPosition());
-			if (static_cast<size_t>(new_idx) >= m_memory.size())
+			StateWrapper sw(IsSaving() ? static_cast<StateWrapper::IStream*>(&save_stream.value()) :
+										 static_cast<StateWrapper::IStream*>(&load_stream.value()),
+				IsSaving() ? StateWrapper::Mode::Write : StateWrapper::Mode::Read, g_SaveVersion);
+
+			okay = okay && g_Sio0.DoState(sw);
+			okay = okay && g_Sio2.DoState(sw);
+			okay = okay && g_MultitapArr.at(0).DoState(sw);
+			okay = okay && g_MultitapArr.at(1).DoState(sw);
+
+			if (!okay || !sw.IsGood())
 				return false;
 
-			m_idx = new_idx;
+			if (IsSaving())
+			{
+				FreezeMem(const_cast<u8*>(save_stream->GetBuffer().data()), save_stream->GetPosition());
+			}
+			else
+			{
+				const int new_idx = m_idx + static_cast<int>(load_stream->GetPosition());
+				if (static_cast<size_t>(new_idx) >= m_memory.size())
+					return false;
+
+				m_idx = new_idx;
+			}
 		}
+
+		FREEZE_LAP("  iop sif+rcnt+sio");
+		okay = okay && cdrFreeze();
+		FREEZE_LAP("  cdrFreeze");
+		okay = okay && cdvdFreeze();
+		FREEZE_LAP("  cdvdFreeze");
 	}
 
-	FREEZE_LAP("  iop sif+rcnt+sio");
-	okay = okay && cdrFreeze();
-	FREEZE_LAP("  cdrFreeze");
-	okay = okay && cdvdFreeze();
-	FREEZE_LAP("  cdvdFreeze");
 
 	// technically this is HLE BIOS territory, but we don't have enough such stuff
 	// to merit an HLE Bios sub-section... yet.
@@ -1299,6 +1309,8 @@ bool SaveState_UnzipFromDisk(const std::string& filename, Error* error)
 // --------------------------------------------------------------------------------------
 static bool FastFreezeSpu2(SaveStateBase& state, bool saving)
 {
+	if (g_FastSkipIop)
+		return true;
 	freezeData fP = {};
 	if (SPU2freeze(FreezeAction::Size, &fP) != 0)
 		return false;
@@ -1320,10 +1332,12 @@ static bool FastFreezeSpu2(SaveStateBase& state, bool saving)
 // The IOP/HW/VU memory blocks, in the same order as the normal save state entries.
 static void FastFreezeBlocks(SaveStateBase& state, ProfLap& prof)
 {
-	state.FreezeMem(iopMem->Main, static_cast<int>(Ps2MemSize::ExposedIopRam));
+	if (!g_FastSkipIop)
+		state.FreezeMem(iopMem->Main, static_cast<int>(Ps2MemSize::ExposedIopRam));
 	prof.Lap("IOP RAM");
 	state.FreezeMem(eeHw, static_cast<int>(sizeof(eeHw)));
-	state.FreezeMem(iopHw, static_cast<int>(sizeof(iopHw)));
+	if (!g_FastSkipIop)
+		state.FreezeMem(iopHw, static_cast<int>(sizeof(iopHw)));
 	state.FreezeMem(eeMem->Scratch, static_cast<int>(sizeof(eeMem->Scratch)));
 	state.FreezeMem(vuRegs[0].Mem, static_cast<int>(VU0_MEMSIZE));
 	state.FreezeMem(vuRegs[1].Mem, static_cast<int>(VU1_MEMSIZE));

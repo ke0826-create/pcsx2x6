@@ -1556,7 +1556,7 @@ namespace Rollback
 				int pattern = -1;  // artificial lateness of the peers' inputs (sess::kPatterns index), -1 = none
 				u32 synthetic = 1;
 				u32 start = 0;     // battle frame at which the rollback mode starts (same on all emulators)
-				u32 debug = 0;     // bit 0: take no snapshots, bit 1: never restore (mispredictions are ignored); for isolating faults
+				u32 debug = 0;     // bit 0: take no snapshots, bit 1: never restore (mispredictions are ignored), bit 2: EE-only snapshots (IOP is not rolled back)
 			};
 
 			St st = St::Idle;
@@ -1650,6 +1650,7 @@ namespace Rollback
 				resim = false;
 				LogStats(why);
 				RollbackNet::Close();
+				g_FastSkipIop = false;
 				st = St::Idle;
 				act = Act::None;
 				for (sess::Slot& s : ring)
@@ -2054,6 +2055,7 @@ namespace Rollback
 							return true;
 						}
 						s_prev_limiter = VMManager::GetLimiterMode();
+						g_FastSkipIop = (cfg.debug & 4) != 0;
 						LocalStep(F);
 						WriteAll(F);
 						if (!(cfg.debug & 1))

@@ -66,6 +66,10 @@ extern bool g_SaveStateProfile;
 // no screenshot, no GS (VRAM and registers stay as they are; the game re-sends GS state every frame),
 // no USB/PAD/achievements, and only the EE RAM regions listed in ee_regions. Keep the object between
 // calls: the buffers keep their capacity, so after the first call a save does not allocate.
+// Rollback: when true the fast snapshot leaves out everything that belongs to the IOP side (IOP RAM and registers, SIF,
+// IOP timers, SIO, CD, SPU2): only the EE side is saved and restored; the IOP keeps running forward.
+extern bool g_FastSkipIop;
+
 struct FastRegion
 {
 	u32 offset; // EE RAM offset, multiple of 4096
