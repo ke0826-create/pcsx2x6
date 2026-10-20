@@ -6,6 +6,7 @@
 #include "common/StringUtil.h"
 #include "ps2/BiosTools.h"
 #include "R5900.h"
+#include "Rollback.h"
 #include "R3000A.h"
 #include "ps2/pgif.h" // pgif init
 #include "VUmicro.h"
@@ -806,6 +807,16 @@ int isBreakpointNeeded(u32 addr)
 
 int isMemcheckNeeded(u32 pc)
 {
+	if (Rollback::g_watch_jit && pc >= 0x160000 && pc < 0x1A0000)
+	{
+		u32 a = pc;
+		if (isBranchOrJump(a))
+			a += 4;
+		const OPCODE& wop = GetInstruction(memRead32(a));
+		if (wop.flags & IS_STORE)
+			return a == pc ? 1 : 2;
+	}
+
 	if (CBreakPoints::GetNumMemchecks() == 0)
 		return 0;
 

@@ -50,4 +50,8 @@ namespace Rollback
 	/// wall time, battle frame and guest PC to rb_watch_log.txt.
 	extern bool g_watch_on;
 	void WatchWrite(u32 addr, u32 size, u64 value);
+	/// JIT variant: stores executed by guest code in [0x160000, 0x1A0000) (the HUD code) are compiled as single-instruction
+	/// blocks that call WatchJit(op, pc) before the store (registers are flushed to cpuRegs at that point).
+	extern bool g_watch_jit;
+	void WatchJit(u32 op, u32 pc);
 } // namespace Rollback

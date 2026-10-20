@@ -11,6 +11,7 @@
 #include "Patch.h"
 #include "R3000A.h"
 #include "R5900OpcodeTables.h"
+#include "Rollback.h"
 #include "VMManager.h"
 #include "vtlb.h"
 #include "x86/BaseblockEx.h"
@@ -1624,6 +1625,13 @@ bool encodeMemcheck()
 
 	const u32 op = memRead32(needed == 2 ? pc + 4 : pc);
 	const OPCODE& opcode = GetInstruction(op);
+
+	if (Rollback::g_watch_jit && CBreakPoints::GetNumMemchecks() == 0)
+	{
+		iFlushCall(FLUSH_EVERYTHING | FLUSH_PC);
+		xFastCall((void*)Rollback::WatchJit, op, needed == 2 ? pc + 4 : pc);
+		return true;
+	}
 
 	const bool store = (opcode.flags & IS_STORE) != 0;
 	switch (opcode.flags & MEMTYPE_MASK)

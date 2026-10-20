@@ -1763,6 +1763,11 @@ namespace Rollback
 
 			void WatchStop()
 			{
+				if (Rollback::g_watch_jit)
+				{
+					Rollback::g_watch_jit = false;
+					Cpu->Clear(0x160000, 0x40000 / 4); // compile the HUD code normally again
+				}
 				Rollback::g_watch_on = false;
 				if (watch_file)
 				{
@@ -1787,10 +1792,15 @@ namespace Rollback
 				watch_file = std::fopen("rb_watch_log.txt", "a");
 				watch_lines = 0;
 				Rollback::g_watch_on = watch_file != nullptr;
-				Console.WriteLn("RbNet: EE write watch on: %u ranges (interpreter only)", static_cast<u32>(watch_ranges.size()));
+				if (Rollback::g_watch_on)
+				{
+					Rollback::g_watch_jit = true;
+					Cpu->Clear(0x160000, 0x40000 / 4); // recompile the HUD code with the store hooks
+				}
+				Console.WriteLn("RbNet: EE write watch on: %u ranges", static_cast<u32>(watch_ranges.size()));
 			}
 
-			void WatchWrite(u32 addr, u32 size, u64 val)
+			void WatchWrite(u32 addr, u32 size, u64 val, u32 pc)
 			{
 				addr &= 0x1FFFFFFFu;
 				if (!watch_file || addr >= 0x2000000u)
@@ -1821,7 +1831,7 @@ namespace Rollback
 				if (p > 0x100000u && p < 0x2000000u)
 					std::memcpy(&bf, eeMem->Main + p + 0xC, 4);
 				const double t = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() / 1000.0;
-				std::fprintf(watch_file, "%.3f BF=%u PC=%08X A=%06X S=%u V=%llX O=%llX\n", t, bf, cpuRegs.pc - 4, addr, size,
+				std::fprintf(watch_file, "%.3f BF=%u PC=%08X A=%06X S=%u V=%llX O=%llX\n", t, bf, pc, addr, size,
 					static_cast<unsigned long long>(nv), static_cast<unsigned long long>(old));
 				if ((watch_lines & 63u) == 0)
 					std::fflush(watch_file);
@@ -2864,9 +2874,30 @@ namespace Rollback
 	bool g_sif1_drop = false;
 	bool g_watch_on = false;
 
+	bool g_watch_jit = false;
+
 	void WatchWrite(u32 addr, u32 size, u64 value)
 	{
-		rn::WatchWrite(addr, size, value);
+		rn::WatchWrite(addr, size, value, cpuRegs.pc - 4);
+	}
+
+	void WatchJit(u32 op, u32 pc)
+	{
+		const u32 rs = (op >> 21) & 31, rt = (op >> 16) & 31;
+		const u32 addr = cpuRegs.GPR.r[rs].UL[0] + static_cast<u32>(static_cast<s32>(static_cast<s16>(op & 0xFFFF)));
+		u32 size = 0;
+		u64 v = 0;
+		switch (op >> 26)
+		{
+			case 0x28: size = 1; v = cpuRegs.GPR.r[rt].UD[0]; break; // SB
+			case 0x29: size = 2; v = cpuRegs.GPR.r[rt].UD[0]; break; // SH
+			case 0x2B: size = 4; v = cpuRegs.GPR.r[rt].UD[0]; break; // SW
+			case 0x3F: size = 8; v = cpuRegs.GPR.r[rt].UD[0]; break; // SD
+			case 0x1F: size = 16; v = cpuRegs.GPR.r[rt].UD[0]; break; // SQ
+			case 0x39: size = 4; v = fpuRegs.fpr[rt].UL; break; // SWC1
+			default: return;
+		}
+		rn::WatchWrite(addr, size, v, pc);
 	}
 
 	void LogSif0Write(u32 ee_addr, const void* data, u32 bytes)
