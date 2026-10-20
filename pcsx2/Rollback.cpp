@@ -1302,9 +1302,29 @@ namespace Rollback
 				return h;
 			}
 
+			// Raw copies of the unit structures ("nb_dump_bf<N>.bin": per active unit u32 index + kUnitSize bytes), so that the
+			// emulators' copies can be compared word by word offline (which fields differ between machines).
+			void DumpUnits(u32 bf, const u32* ptrs)
+			{
+				char name[64];
+				std::snprintf(name, sizeof(name), "nb_dump_bf%u.bin", bf);
+				std::FILE* f = std::fopen(name, "wb");
+				if (!f)
+					return;
+				for (u32 k = 0; k < 8; k++)
+				{
+					if (!ptrs[k])
+						continue;
+					std::fwrite(&k, sizeof(k), 1, f);
+					std::fwrite(eeMem->Main + ptrs[k], 1, kUnitSize, f);
+				}
+				std::fclose(f);
+			}
+
 			void LogCensus(u32 bf, const u32* ptrs)
 			{
 				const u32 ctx = R32(kGpBase - 0x7D20);
+				Console.WriteLn("NetBattle: census ctx pointer *(gp-0x7D20)=0x%X", ctx);
 				if (Plausible(ctx))
 				{
 					Console.WriteLn("NetBattle: census at BF=%u: ctx=0x%X (+0x1D=%u +0x1F=%u +0x27=%u +0xCA=%u); comm: my slot(0x6302BE)=%u, C=%u, D=%u",
@@ -1403,6 +1423,15 @@ namespace Rollback
 					Console.WriteLn("NetBattle: BF=%u h=%016llx p0=%.2f,%.2f,%.2f hp0=%.0f g2=%u", bf,
 						static_cast<unsigned long long>(HashUnits(ptrs)), first ? RF(first + 0x60) : 0.0f, first ? RF(first + 0x64) : 0.0f,
 						first ? RF(first + 0x68) : 0.0f, first ? RF(first + 0x1F4) : 0.0f, g2 ? 1u : 0u);
+					// every active unit: slot, position, HP (shows that each slot's mailbox word drives its own unit)
+					for (u32 k = 0; k < 8; k++)
+					{
+						if (ptrs[k])
+							Console.WriteLn("NetBattle: BF=%u u%u slot=%u pos=%.2f,%.2f,%.2f hp=%.0f", bf, k, R8(ptrs[k] + 6),
+								RF(ptrs[k] + 0x60), RF(ptrs[k] + 0x64), RF(ptrs[k] + 0x68), RF(ptrs[k] + 0x1F4));
+					}
+					if (logged == 120 || logged == 600)
+						DumpUnits(bf, ptrs);
 					logged++;
 					ctl[LOGGED] = logged;
 				}
