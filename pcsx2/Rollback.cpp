@@ -1765,15 +1765,19 @@ namespace Rollback
 				return true;
 			}
 
-			// Voice time limit. The operator message window lives as long as the voice channel 3 is "active" (0x151DE0(3): the channel
-			// table entry at 0x4B8860+3*8 names a voice record whose state is 3 = playing). The end of the voice is reported by the
-			// audio stream library (ADXT PLAYEND), which needs the IOP's playback progress; after an EE-only restore it can stay away
-			// forever and the window stays. Once the record has been playing for more than voice_limit frames the entry is released
-			// the way the game itself does it (both words -1, see 0x1525E0), which closes the window.
+			// Operator message window time limit. The window (flag halfword 0x571B70, set by 0x18EFA0) stays as long as the voice
+			// channel 3 is "active" (0x151DE0(3): the channel table entry at 0x4B8860+3*8 names a voice record in state 3 = playing).
+			// The end of the voice is reported by the audio stream library (ADXT PLAYEND), which needs the IOP's playback progress;
+			// after an EE-only restore it can stay away forever and the window stays. Once the window flag has been set for more
+			// than voice_limit frames the channel entry is released the way the game does it (both words -1, see 0x1525E0), which
+			// closes the window. The start frame is tracked here; after a rewind (F below it) it is simply taken again.
+			u32 voice_start = 0;
+
 			void VoiceReadConfig()
 			{
 				voice_limit = 0;
 				voice_cuts = 0;
+				voice_start = 0;
 				if (!(cfg.debug & 4096))
 					return;
 				voice_limit = 360;
@@ -1784,7 +1788,7 @@ namespace Rollback
 						voice_limit = n;
 					std::fclose(f);
 				}
-				Console.WriteLn("RbNet: operator voice time limit: %u frames", voice_limit);
+				Console.WriteLn("RbNet: operator window time limit: %u frames", voice_limit);
 			}
 
 			void VoiceTimeout(u32 F)
@@ -1792,22 +1796,30 @@ namespace Rollback
 				if (!voice_limit)
 					return;
 				u8* m = eeMem->Main;
-				u32 idx = 0, ser = 0, state = 0;
+				u16 flag = 0;
+				std::memcpy(&flag, m + 0x571B70, 2);
+				if (!flag)
+				{
+					voice_start = 0;
+					return;
+				}
+				if (voice_start == 0 || F < voice_start)
+				{
+					voice_start = F;
+					return;
+				}
+				if (F - voice_start <= voice_limit)
+					return;
+				u32 idx = 0, ser = 0;
 				std::memcpy(&idx, m + 0x4B8878, 4);
 				std::memcpy(&ser, m + 0x4B887C, 4);
-				if (idx > 2)
-					return; // -1 = nothing playing on the channel
-				const u32 rec = 0x4B8880 + idx * 0x5C;
-				u16 cnt = 0;
-				std::memcpy(&state, m + rec + 0xC, 4);
-				std::memcpy(&cnt, m + rec + 0x1C, 2);
-				if (state != 3 || cnt <= voice_limit)
-					return;
 				const u32 neg = 0xFFFFFFFFu;
 				std::memcpy(m + 0x4B8878, &neg, 4);
 				std::memcpy(m + 0x4B887C, &neg, 4);
 				if (voice_cuts++ < 8)
-					Console.WriteLn("RbNet: operator voice (record %u, serial %u) cut after %u frames at BF %u", idx, ser, static_cast<u32>(cnt), F);
+					Console.WriteLn("RbNet: operator window open since BF %u: channel 3 released at BF %u (was record %d, serial %d)", voice_start, F,
+						static_cast<s32>(idx), static_cast<s32>(ser));
+				voice_start = F; // if it is still there after another limit, release again
 			}
 
 			void KeepReadConfig()
@@ -2255,7 +2267,7 @@ namespace Rollback
 					tag, live_frames, rollbacks, resim_frames, max_depth, pred_ok, pred_bad, stalls, ms_stall, saves, ms_restore, ms_save, pkts_in, pkts_bad, pkts_out,
 					pkts_dropped, anomalies);
 				if (voice_limit)
-					Console.WriteLn("RbNet: operator voice cut %u times (limit %u frames)", voice_cuts, voice_limit);
+					Console.WriteLn("RbNet: operator window: channel released %u times (limit %u frames)", voice_cuts, voice_limit);
 				if (sif_logged_w || sif_logged_i)
 				{
 					Console.WriteLn("RbNet: SIF0 deliveries logged: %u data + %u interrupts; replayed %u data + %u interrupts", sif_logged_w, sif_logged_i,
