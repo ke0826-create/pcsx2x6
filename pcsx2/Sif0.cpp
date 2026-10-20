@@ -39,7 +39,7 @@ static __fi bool WriteFifoToEE()
 	}
 
 	sif0.fifo.read((u32*)ptag, readSize << 2);
-	if (Rollback::g_sif0_log)
+	if (Rollback::g_sif0_log || Rollback::g_watch_on)
 		Rollback::LogSif0Write(sif0ch.madr, ptag, readSize << 4);
 
 	// Clearing handled by vtlb memory protection and manual blocks.

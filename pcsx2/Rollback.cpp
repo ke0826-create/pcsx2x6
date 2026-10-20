@@ -1686,6 +1686,7 @@ namespace Rollback
 			bool sif_replaying = false;
 			// EE write watch (see Rollback.h)
 			std::vector<std::pair<u32, u32>> watch_ranges;
+			std::vector<std::pair<u32, u32>> watch_sif_ranges; // lines "s <lo> <hi>": SIF0 (IOP -> EE DMA) deliveries and replays into them
 			std::FILE* watch_file = nullptr;
 			u32 watch_lines = 0;
 			// rb_sif.txt (read when the session begins): lines "i <lo> <hi>" / "e <lo> <hi>" (hex EE addresses). With include ranges only the
@@ -1775,6 +1776,7 @@ namespace Rollback
 					watch_file = nullptr;
 				}
 				watch_ranges.clear();
+				watch_sif_ranges.clear();
 			}
 
 			void WatchReadConfig()
@@ -1783,11 +1785,22 @@ namespace Rollback
 				std::FILE* f = std::fopen("rb_watch.txt", "r");
 				if (!f)
 					return;
-				unsigned lo = 0, hi = 0;
-				while (std::fscanf(f, " %x %x", &lo, &hi) == 2)
-					watch_ranges.emplace_back(lo, hi);
+				{
+					char line[128];
+					while (std::fgets(line, sizeof(line), f))
+					{
+						unsigned lo = 0, hi = 0;
+						if (line[0] == 's' || line[0] == 'S')
+						{
+							if (std::sscanf(line + 1, " %x %x", &lo, &hi) == 2)
+								watch_sif_ranges.emplace_back(lo, hi);
+						}
+						else if (std::sscanf(line, " %x %x", &lo, &hi) == 2)
+							watch_ranges.emplace_back(lo, hi);
+					}
+				}
 				std::fclose(f);
-				if (watch_ranges.empty())
+				if (watch_ranges.empty() && watch_sif_ranges.empty())
 					return;
 				watch_file = std::fopen("rb_watch_log.txt", "a");
 				watch_lines = 0;
@@ -1798,6 +1811,35 @@ namespace Rollback
 					Cpu->Clear(0x100000, 0xA0000 / 4); // recompile the sound/HUD code with the store hooks
 				}
 				Console.WriteLn("RbNet: EE write watch on: %u ranges", static_cast<u32>(watch_ranges.size()));
+			}
+
+			// A SIF0 chunk (kind 'D') or a replayed one (kind 'P') that overlaps a watched SIF range: logged with the bytes
+			// it wrote there (first 8 of the overlap), the frame and the wall time.
+			void WatchSif(u32 ee_addr, const void* data, u32 bytes, char kind)
+			{
+				if (!watch_file || watch_sif_ranges.empty())
+					return;
+				const u32 a = ee_addr & 0x1FFFFFFFu;
+				for (const auto& r : watch_sif_ranges)
+				{
+					if (a < r.second && a + bytes > r.first)
+					{
+						const u32 lo = std::max(a, r.first);
+						const u32 hi = std::min(a + bytes, r.second);
+						if (watch_lines++ > 800000u)
+							return;
+						u64 v = 0;
+						std::memcpy(&v, static_cast<const u8*>(data) + (lo - a), std::min<u32>(8, hi - lo));
+						u32 bf = 0;
+						u32 p = 0;
+						std::memcpy(&p, eeMem->Main + (0x4A8370u - 0x7D10u), 4);
+						if (p > 0x100000u && p < 0x2000000u)
+							std::memcpy(&bf, eeMem->Main + p + 0xC, 4);
+						const double t = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() / 1000.0;
+						std::fprintf(watch_file, "%.3f BF=%u PC=00000000 %c=%08X S=%u V=%llX\n", t, bf, kind, lo, hi - lo, static_cast<unsigned long long>(v));
+						break;
+					}
+				}
 			}
 
 			// a load of the guest at `pc` (logged without a range filter; the value is read from RAM before the load)
@@ -1920,6 +1962,8 @@ namespace Rollback
 				{
 					std::memcpy(eeMem->Main + e.addr, e.data.data(), e.data.size());
 					sif_replayed_w++;
+					if (Rollback::g_watch_on)
+						WatchSif(e.addr, e.data.data(), static_cast<u32>(e.data.size()), 'P');
 				}
 				else
 				{
@@ -2937,7 +2981,10 @@ namespace Rollback
 
 	void LogSif0Write(u32 ee_addr, const void* data, u32 bytes)
 	{
-		rn::SifLogWrite(ee_addr, data, bytes);
+		if (g_watch_on)
+			rn::WatchSif(ee_addr, data, bytes, 'D');
+		if (g_sif0_log)
+			rn::SifLogWrite(ee_addr, data, bytes);
 	}
 
 	void LogSif0Irq()
