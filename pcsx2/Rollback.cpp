@@ -1556,6 +1556,7 @@ namespace Rollback
 				int pattern = -1;  // artificial lateness of the peers' inputs (sess::kPatterns index), -1 = none
 				u32 synthetic = 1;
 				u32 start = 0;     // battle frame at which the rollback mode starts (same on all emulators)
+				u32 debug = 0;     // bit 0: take no snapshots, bit 1: never restore (mispredictions are ignored); for isolating faults
 			};
 
 			St st = St::Idle;
@@ -1599,11 +1600,11 @@ namespace Rollback
 				std::FILE* f = std::fopen("rb_net.txt", "r");
 				if (!f)
 					return;
-				unsigned enable = 0, slot = 0, port = 0, delay = 0, synthetic = 0, start = 0;
+				unsigned enable = 0, slot = 0, port = 0, delay = 0, synthetic = 0, start = 0, debug = 0;
 				int pattern = -1;
-				const int n = std::fscanf(f, "%u %u %u %u %d %u %u", &enable, &slot, &port, &delay, &pattern, &synthetic, &start);
+				const int n = std::fscanf(f, "%u %u %u %u %d %u %u %u", &enable, &slot, &port, &delay, &pattern, &synthetic, &start, &debug);
 				std::fclose(f);
-				if (n != 7)
+				if (n != 7 && n != 8)
 					return;
 				cfg.enable = enable;
 				cfg.slot = slot;
@@ -1612,6 +1613,7 @@ namespace Rollback
 				cfg.pattern = pattern;
 				cfg.synthetic = synthetic;
 				cfg.start = start;
+				cfg.debug = (n == 8) ? debug : 0;
 			}
 
 			// Idle: look for the config file every kPollEvery vsyncs.
@@ -1844,7 +1846,7 @@ namespace Rollback
 
 			void MaybeSave(u32 F)
 			{
-				if (F > base && (F - base) % kK == 0)
+				if (!(cfg.debug & 1) && F > base && (F - base) % kK == 0)
 				{
 					save_slot = ((F - base) / kK) % kRing;
 					save_frame = F;
@@ -1935,6 +1937,8 @@ namespace Rollback
 					}
 					ms_stall += t.GetTimeMilliseconds();
 				}
+				if (m != kNoFrame && (cfg.debug & 2))
+					m = kNoFrame; // debug: ignore the misprediction
 				if (m != kNoFrame)
 				{
 					RequestRollback(F, m);
@@ -2052,15 +2056,18 @@ namespace Rollback
 						s_prev_limiter = VMManager::GetLimiterMode();
 						LocalStep(F);
 						WriteAll(F);
-						ring[0].snap.ee_regions = s_regions;
-						if (!SaveState_FastSave(ring[0].snap, false, &error))
+						if (!(cfg.debug & 1))
 						{
-							Console.Error("RbNet: first snapshot failed: %s", error.GetDescription().c_str());
-							Stop("save failed");
-							return true;
+							ring[0].snap.ee_regions = s_regions;
+							if (!SaveState_FastSave(ring[0].snap, false, &error))
+							{
+								Console.Error("RbNet: first snapshot failed: %s", error.GetDescription().c_str());
+								Stop("save failed");
+								return true;
+							}
+							ring[0].frame = F;
+							ring[0].valid = true;
 						}
-						ring[0].frame = F;
-						ring[0].valid = true;
 						st = St::Run;
 						const u32 ctx = nb::R32(nb::kGpBase - 0x7D20);
 						Console.WriteLn("RbNet: running from BF %u (guest ctx local slot %u, configured slot %u)", F,
