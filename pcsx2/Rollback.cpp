@@ -1684,6 +1684,10 @@ namespace Rollback
 			u64 ring_seq[5] = {};
 			u32 cur_frame = 0;
 			bool sif_replaying = false;
+			// EE write watch (see Rollback.h)
+			std::vector<std::pair<u32, u32>> watch_ranges;
+			std::FILE* watch_file = nullptr;
+			u32 watch_lines = 0;
 			// rb_sif.txt (read when the session begins): lines "i <lo> <hi>" / "e <lo> <hi>" (hex EE addresses). With include ranges only the
 			// deliveries into them are replayed, otherwise all except those into an exclude range. The interrupt of a transfer follows the
 			// decision of the last data chunk before it.
@@ -1755,6 +1759,72 @@ namespace Rollback
 						return false;
 				}
 				return true;
+			}
+
+			void WatchStop()
+			{
+				Rollback::g_watch_on = false;
+				if (watch_file)
+				{
+					std::fclose(watch_file);
+					watch_file = nullptr;
+				}
+				watch_ranges.clear();
+			}
+
+			void WatchReadConfig()
+			{
+				WatchStop();
+				std::FILE* f = std::fopen("rb_watch.txt", "r");
+				if (!f)
+					return;
+				unsigned lo = 0, hi = 0;
+				while (std::fscanf(f, " %x %x", &lo, &hi) == 2)
+					watch_ranges.emplace_back(lo, hi);
+				std::fclose(f);
+				if (watch_ranges.empty())
+					return;
+				watch_file = std::fopen("rb_watch_log.txt", "a");
+				watch_lines = 0;
+				Rollback::g_watch_on = watch_file != nullptr;
+				Console.WriteLn("RbNet: EE write watch on: %u ranges (interpreter only)", static_cast<u32>(watch_ranges.size()));
+			}
+
+			void WatchWrite(u32 addr, u32 size, u64 val)
+			{
+				addr &= 0x1FFFFFFFu;
+				if (!watch_file || addr >= 0x2000000u)
+					return;
+				bool hit = false;
+				for (const auto& r : watch_ranges)
+				{
+					if (addr < r.second && addr + size > r.first)
+					{
+						hit = true;
+						break;
+					}
+				}
+				if (!hit)
+					return;
+				u64 old = 0;
+				std::memcpy(&old, eeMem->Main + addr, size > 8 ? 8 : size);
+				u64 nv = val;
+				if (size < 8)
+					nv &= ((1ull << (size * 8)) - 1);
+				if (size <= 8 && old == nv)
+					return;
+				if (watch_lines++ > 800000u)
+					return;
+				u32 bf = 0;
+				u32 p = 0;
+				std::memcpy(&p, eeMem->Main + (0x4A8370u - 0x7D10u), 4);
+				if (p > 0x100000u && p < 0x2000000u)
+					std::memcpy(&bf, eeMem->Main + p + 0xC, 4);
+				const double t = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() / 1000.0;
+				std::fprintf(watch_file, "%.3f BF=%u PC=%08X A=%06X S=%u V=%llX O=%llX\n", t, bf, cpuRegs.pc - 4, addr, size,
+					static_cast<unsigned long long>(nv), static_cast<unsigned long long>(old));
+				if ((watch_lines & 63u) == 0)
+					std::fflush(watch_file);
 			}
 
 			void SifReadConfig()
@@ -2062,6 +2132,7 @@ namespace Rollback
 					VMManager::SetLimiterMode(s_prev_limiter);
 				resim = false;
 				Rollback::g_sif1_drop = false;
+				WatchStop();
 				LogStats(why);
 				RollbackNet::Close();
 				outq.clear();
@@ -2537,6 +2608,7 @@ namespace Rollback
 						sif_hist.clear();
 						sif_last_w_replay = true;
 						SifReadConfig();
+						WatchReadConfig();
 						g_sif0_log_flag = (cfg.debug & 512) != 0;
 						g_FastKeepSif = (cfg.debug & 1024) != 0;
 						Rollback::g_sif1_drop = false;
@@ -2790,6 +2862,12 @@ namespace Rollback
 
 	bool g_sif0_log = false;
 	bool g_sif1_drop = false;
+	bool g_watch_on = false;
+
+	void WatchWrite(u32 addr, u32 size, u64 value)
+	{
+		rn::WatchWrite(addr, size, value);
+	}
 
 	void LogSif0Write(u32 ee_addr, const void* data, u32 bytes)
 	{

@@ -44,4 +44,10 @@ namespace Rollback
 	/// While the frames are re-simulated after a rollback (debug bit 2048) the EE -> IOP SIF1 data is dropped: the IOP is not
 	/// rolled back, so it already got those requests (sound, RPCs) in the original run and must not get them twice.
 	extern bool g_sif1_drop;
+
+	/// EE write watch (rb_watch.txt: lines "<lo> <hi>" in hex, physical EE addresses). Only works with the interpreter (the
+	/// recompiler's stores bypass vtlb_memWrite): every store into a watched range that changes the value is appended with
+	/// wall time, battle frame and guest PC to rb_watch_log.txt.
+	extern bool g_watch_on;
+	void WatchWrite(u32 addr, u32 size, u64 value);
 } // namespace Rollback

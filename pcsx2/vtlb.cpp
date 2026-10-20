@@ -23,6 +23,7 @@
 #include "IopMem.h"
 #include "Host.h"
 #include "VMManager.h"
+#include "Rollback.h"
 
 #include "common/BitUtils.h"
 #include "common/Error.h"
@@ -248,6 +249,9 @@ void vtlb_memWrite(u32 addr, DataType data)
 {
 	static const uint DataSize = sizeof(DataType) * 8;
 
+	if (Rollback::g_watch_on)
+		Rollback::WatchWrite(addr, sizeof(DataType), static_cast<u64>(data));
+
 	auto vmv = vtlbdata.vmap[addr >> VTLB_PAGE_BITS];
 
 	if (!vmv.isHandler(addr))
@@ -287,6 +291,9 @@ void vtlb_memWrite(u32 addr, DataType data)
 
 void TAKES_R128 vtlb_memWrite128(u32 mem, r128 value)
 {
+	if (Rollback::g_watch_on)
+		Rollback::WatchWrite(mem, 16, r128_to_u128(value).lo);
+
 	auto vmv = vtlbdata.vmap[mem >> VTLB_PAGE_BITS];
 
 	if (!vmv.isHandler(mem))
