@@ -1513,7 +1513,7 @@ namespace Rollback
 		namespace rn
 		{
 			constexpr u32 kSlots = 4;
-			constexpr u32 kMaxFrames = 24000; // frames after the start frame that can be handled (400 s)
+			constexpr u32 kMaxFrames = 60000; // frames after the start frame that can be handled (1000 s)
 			constexpr u32 kK = 4;             // snapshot interval
 			constexpr u32 kRing = 5;          // snapshots kept
 			constexpr u32 kMaxDepth = 10;     // wait when more than this many frames of a peer are predicted
@@ -1546,6 +1546,7 @@ namespace Rollback
 				Begin,
 				Save,
 				Rollback,
+				Cleanup, // after the battle: put the two guest patches back
 			};
 
 			struct Cfg
@@ -1575,6 +1576,8 @@ namespace Rollback
 			u32 target = 0;
 			bool resim = false;
 			u32 last_logged = kNoFrame;
+			u32 session = 0;      // counts the rollback sessions of this run (a new one starts for every battle)
+			u32 last_state = 0x100; // last logged value of this slot's game state byte
 			u32 save_slot = 0, save_frame = 0, roll_slot = 0;
 			sess::Slot ring[kRing];
 			std::vector<u32> truth[kSlots];
@@ -1688,7 +1691,7 @@ namespace Rollback
 					pkts_dropped, anomalies);
 			}
 
-			void Stop(const char* why)
+			void Stop(const char* why, bool revert = false)
 			{
 				if (st == St::Idle)
 					return;
@@ -1706,8 +1709,17 @@ namespace Rollback
 					s.snap = FastSnapshot();
 					s.valid = false;
 				}
-				// The guest patches stay in place: the game cannot go back to its own comm in the middle of a battle.
-				Console.WriteLn("RbNet: stopped (%s). The mailbox/comm-stop guest patches are still applied.", why);
+				if (revert && VMManager::HasValidVM())
+				{
+					// The battle is over: the game's own comm is needed again (results, rejoin, the next battle).
+					Console.WriteLn("RbNet: stopped (%s). Reverting the mailbox/comm-stop guest patches at the next clean point.", why);
+					RequestAct(Act::Cleanup);
+				}
+				else
+				{
+					// In the middle of a battle the game cannot go back to its own comm: the patches stay.
+					Console.WriteLn("RbNet: stopped (%s). The mailbox/comm-stop guest patches are still applied.", why);
+				}
 			}
 
 			u32 ArtDelay(u32 slot, u32 f)
@@ -1907,8 +1919,8 @@ namespace Rollback
 					for (const u32 off : kFields)
 						h = (h ^ nb::R32(ptrs[k] + off)) * 1099511628211ull;
 				}
-				Console.WriteLn("RbNet: BF=%u s=%016llx u0=%.2f,%.2f,%.2f", F, static_cast<unsigned long long>(h),
-					first ? nb::RF(first + 0x60) : 0.0f, first ? nb::RF(first + 0x64) : 0.0f, first ? nb::RF(first + 0x68) : 0.0f);
+				Console.WriteLn("RbNet: BF=%u s=%016llx u0=%.2f,%.2f,%.2f n=%u", F, static_cast<unsigned long long>(h),
+					first ? nb::RF(first + 0x60) : 0.0f, first ? nb::RF(first + 0x64) : 0.0f, first ? nb::RF(first + 0x68) : 0.0f, session);
 				last_logged = F;
 			}
 
@@ -1956,7 +1968,7 @@ namespace Rollback
 				u32 ptrs[8];
 				if (!nb::ReadBf(&F) || nb::Units(ptrs) < 2)
 				{
-					Stop("battle ended");
+					Stop("battle ended", true);
 					return;
 				}
 				if (F != expect)
@@ -2017,6 +2029,15 @@ namespace Rollback
 				}
 
 				LogVerified(F, ptrs);
+				{
+					// the guest's game-state byte of this slot (0x5ED060 + 0x50 * slot): log its changes
+					const u32 gs = nb::R8(0x5ED060 + 0x50 * me);
+					if (gs != last_state)
+					{
+						Console.WriteLn("RbNet: game state byte of slot %u: 0x%02X -> 0x%02X at BF %u", me, last_state & 0xFF, gs, F);
+						last_state = gs;
+					}
+				}
 				LocalStep(F);
 				WriteAll(F);
 				live_frames++;
@@ -2108,6 +2129,8 @@ namespace Rollback
 						MeasureRamUse();
 						base = F;
 						expect = F + 1;
+						session++;
+						last_state = 0x100;
 						for (u32 s = 0; s < kSlots; s++)
 						{
 							truth[s].assign(kMaxFrames, 0);
@@ -2190,6 +2213,13 @@ namespace Rollback
 						resim = true;
 						VMManager::SetLimiterMode(LimiterModeType::Unlimited);
 						WriteAll(s.frame); // the word of the snapshot's own frame, now with the corrected input
+						break;
+					}
+					case Act::Cleanup:
+					{
+						const bool ok1 = nb::ApplyG2(false);
+						const bool ok2 = sess::ApplyGuestPatch(false);
+						Console.WriteLn("RbNet: guest patches reverted after the battle (comm stop %s, input mailbox %s)", ok1 ? "ok" : "FAILED", ok2 ? "ok" : "FAILED");
 						break;
 					}
 					case Act::None:
