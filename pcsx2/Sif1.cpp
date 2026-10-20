@@ -7,6 +7,7 @@
 #include "Common.h"
 #include "Sif.h"
 #include "IopHw.h"
+#include "Rollback.h"
 
 _sif sif1;
 
@@ -58,8 +59,22 @@ static __fi bool WriteFifoToIOP()
 
 	SIF_LOG("Sif 1 IOP doing transfer %04X to %08X", readSize, HW_DMA10_MADR);
 
-	sif1.fifo.read((u32*)iopPhysMem(hw_dma10.madr), readSize);
-	psxCpu->Clear(hw_dma10.madr, readSize);
+	if (Rollback::g_sif1_drop)
+	{
+		// Rollback re-simulation: the IOP got this data in the original run. Take it out of the fifo and throw it away.
+		u32 sink[64];
+		for (int left = readSize; left > 0;)
+		{
+			const int n = std::min(left, 64);
+			sif1.fifo.read(sink, n);
+			left -= n;
+		}
+	}
+	else
+	{
+		sif1.fifo.read((u32*)iopPhysMem(hw_dma10.madr), readSize);
+		psxCpu->Clear(hw_dma10.madr, readSize);
+	}
 	hw_dma10.madr += readSize << 2;
 	sif1.iop.cycles += readSize >> 2;		// fixme: should be >> 4
 	sif1.iop.counter -= readSize;

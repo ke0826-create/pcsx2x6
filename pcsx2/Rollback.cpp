@@ -2061,6 +2061,7 @@ namespace Rollback
 				if (resim && VMManager::HasValidVM())
 					VMManager::SetLimiterMode(s_prev_limiter);
 				resim = false;
+				Rollback::g_sif1_drop = false;
 				LogStats(why);
 				RollbackNet::Close();
 				outq.clear();
@@ -2373,6 +2374,7 @@ namespace Rollback
 						return;
 					}
 					resim = false; // back at the frame where the rollback was requested: this is a live hook again
+					Rollback::g_sif1_drop = false;
 					SifApplyUpTo(0xFFFFFFFFu);
 					VMManager::SetLimiterMode(s_prev_limiter);
 				}
@@ -2537,6 +2539,7 @@ namespace Rollback
 						SifReadConfig();
 						g_sif0_log_flag = (cfg.debug & 512) != 0;
 						g_FastKeepSif = (cfg.debug & 1024) != 0;
+						Rollback::g_sif1_drop = false;
 						Rollback::g_sif0_log = g_sif0_log_flag;
 						if (cfg.debug & 16)
 							TraceArm(me);
@@ -2729,6 +2732,7 @@ namespace Rollback
 						ms_restore += t.GetTimeMilliseconds();
 						expect = s.frame + 1;
 						resim = true;
+						Rollback::g_sif1_drop = (cfg.debug & 2048) != 0;
 						VMManager::SetLimiterMode(LimiterModeType::Unlimited);
 						WriteAll(s.frame); // the word of the snapshot's own frame, now with the corrected input
 						break;
@@ -2785,6 +2789,7 @@ namespace Rollback
 	}
 
 	bool g_sif0_log = false;
+	bool g_sif1_drop = false;
 
 	void LogSif0Write(u32 ee_addr, const void* data, u32 bytes)
 	{

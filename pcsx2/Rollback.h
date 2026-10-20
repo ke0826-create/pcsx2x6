@@ -41,4 +41,7 @@ namespace Rollback
 	void LogSif0Write(u32 ee_addr, const void* data, u32 bytes);
 	/// A SIF0 transfer completed (the EE DMAC interrupt is raised).
 	void LogSif0Irq();
+	/// While the frames are re-simulated after a rollback (debug bit 2048) the EE -> IOP SIF1 data is dropped: the IOP is not
+	/// rolled back, so it already got those requests (sound, RPCs) in the original run and must not get them twice.
+	extern bool g_sif1_drop;
 } // namespace Rollback
