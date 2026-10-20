@@ -1686,6 +1686,7 @@ namespace Rollback
 			bool sif_replaying = false;
 			// EE write watch (see Rollback.h)
 			std::vector<std::pair<u32, u32>> watch_ranges;
+			std::vector<std::pair<u32, u32>> user_keep; // rb_keep.txt: EE RAM ranges ("<lo> <hi>" hex) that a restore leaves as they are
 			std::vector<std::pair<u32, u32>> watch_sif_ranges; // lines "s <lo> <hi>": SIF0 (IOP -> EE DMA) deliveries and replays into them
 			std::FILE* watch_file = nullptr;
 			u32 watch_lines = 0;
@@ -1760,6 +1761,22 @@ namespace Rollback
 						return false;
 				}
 				return true;
+			}
+
+			void KeepReadConfig()
+			{
+				user_keep.clear();
+				std::FILE* f = std::fopen("rb_keep.txt", "r");
+				if (!f)
+					return;
+				unsigned lo = 0, hi = 0;
+				while (std::fscanf(f, " %x %x", &lo, &hi) == 2)
+				{
+					if (hi > lo && hi <= 32u * 1024u * 1024u)
+						user_keep.emplace_back(lo, hi);
+				}
+				std::fclose(f);
+				Console.WriteLn("RbNet: rb_keep.txt: %u ranges stay live across a restore", static_cast<u32>(user_keep.size()));
 			}
 
 			void WatchStop()
@@ -2691,6 +2708,7 @@ namespace Rollback
 						sif_hist.clear();
 						sif_last_w_replay = true;
 						SifReadConfig();
+						KeepReadConfig();
 						WatchReadConfig();
 						g_sif0_log_flag = (cfg.debug & 512) != 0;
 						g_FastKeepSif = (cfg.debug & 1024) != 0;
@@ -2817,6 +2835,10 @@ namespace Rollback
 							sif_state_keep.assign(reinterpret_cast<const u8*>(&sif0), reinterpret_cast<const u8*>(&sif0) + sizeof(sif0));
 							sif_state_keep.insert(sif_state_keep.end(), reinterpret_cast<const u8*>(&sif1), reinterpret_cast<const u8*>(&sif1) + sizeof(sif1));
 						}
+						static std::vector<u8> ukeep;
+						ukeep.clear();
+						for (const auto& r : user_keep)
+							ukeep.insert(ukeep.end(), eeMem->Main + r.first, eeMem->Main + r.second);
 						static std::vector<u8> keep;
 						keep.clear();
 						if (cfg.debug & 8)
@@ -2829,6 +2851,15 @@ namespace Rollback
 							Console.Error("RbNet: restore failed: %s", error.GetDescription().c_str());
 							Stop("restore failed");
 							return true;
+						}
+						if (!ukeep.empty())
+						{
+							size_t pos = 0;
+							for (const auto& r : user_keep)
+							{
+								std::memcpy(eeMem->Main + r.first, ukeep.data() + pos, r.second - r.first);
+								pos += r.second - r.first;
+							}
 						}
 						if (!keep.empty())
 						{
