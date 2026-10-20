@@ -84,6 +84,7 @@ namespace
 	} while (0)
 
 bool g_FastSkipIop = false;
+bool g_FastKeepSif = false;
 
 static void PreLoadPrep()
 {
@@ -263,7 +264,7 @@ bool SaveStateBase::FreezeInternals(Error* error)
 	okay = okay && vif0Freeze();
 	okay = okay && vif1Freeze();
 	FREEZE_LAP("  vif0/vif1Freeze");
-	okay = okay && sifFreeze();
+	okay = okay && (g_FastKeepSif || sifFreeze());
 	okay = okay && ipuFreeze();
 	okay = okay && ipuDmaFreeze();
 	FREEZE_LAP("  sif+ipuFreeze");

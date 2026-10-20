@@ -69,6 +69,8 @@ extern bool g_SaveStateProfile;
 // Rollback: when true the fast snapshot leaves out everything that belongs to the IOP side (IOP RAM and registers, SIF,
 // IOP timers, SIO, CD, SPU2): only the EE side is saved and restored; the IOP keeps running forward.
 extern bool g_FastSkipIop;
+// Rollback: when true the fast snapshot does not contain the SIF DMA state (sif0/sif1), so a restore leaves it as it is.
+extern bool g_FastKeepSif;
 
 struct FastRegion
 {

@@ -7,6 +7,7 @@
 #include "Common.h"
 #include "Sif.h"
 #include "IopHw.h"
+#include "Rollback.h"
 
 _sif sif0;
 
@@ -38,6 +39,8 @@ static __fi bool WriteFifoToEE()
 	}
 
 	sif0.fifo.read((u32*)ptag, readSize << 2);
+	if (Rollback::g_sif0_log)
+		Rollback::LogSif0Write(sif0ch.madr, ptag, readSize << 4);
 
 	// Clearing handled by vtlb memory protection and manual blocks.
 	//Cpu->Clear(sif0ch.madr, readSize*4);
@@ -336,6 +339,8 @@ __fi void  sif0Interrupt()
 
 __fi void  EEsif0Interrupt()
 {
+	if (Rollback::g_sif0_log)
+		Rollback::LogSif0Irq();
 	hwDmacIrq(DMAC_SIF0);
 	sif0ch.chcr.STR = false;
 }

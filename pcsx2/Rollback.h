@@ -32,4 +32,13 @@ namespace Rollback
 
 	/// True while a self-test is in progress.
 	bool IsSelfTestRunning();
+
+	/// SIF0 (IOP -> EE DMA) delivery log for the rollback session (see Rollback.cpp, "SIF0 replay"): the IOP is not rolled
+	/// back, so what it delivered to the EE between a snapshot and the rollback would be lost; it is logged here and
+	/// delivered again while the frames are re-simulated.
+	extern bool g_sif0_log;
+	/// A SIF0 chunk was written to EE RAM at ee_addr (physical).
+	void LogSif0Write(u32 ee_addr, const void* data, u32 bytes);
+	/// A SIF0 transfer completed (the EE DMAC interrupt is raised).
+	void LogSif0Irq();
 } // namespace Rollback

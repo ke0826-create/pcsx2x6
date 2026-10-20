@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#define _PC_ // disables the MIPS opcode macros (R3000A.h is included for the SIF structures)
+
 #include "Rollback.h"
 #include "RollbackNet.h"
 
 #include "Common.h"
+#include "Memory.h"
+#include "R3000A.h"
+#include "Sif.h"
 #include "Config.h"
 #include "DEV9/ACJV.h"
 #include "MemoryTypes.h"
@@ -1561,7 +1566,8 @@ namespace Rollback
 				u32 debug = 0;     // bit 0: take no snapshots, bit 1: never restore (mispredictions are ignored), bit 2: EE-only snapshots (IOP is not rolled back),
 				                   // bit 3: keep the game's comm module data (EE RAM) live: a restore does not rewind it,
 				                   // bit 4: comm-module trace, bit 5: also stop the other call sites of the comm master step (G3);
-				                   // bits 6/7/8: only the G3 site 0x156918 / 0x1DD558 / 0x1DDE98
+				                   // bits 6/7/8: only the G3 site 0x156918 / 0x1DD558 / 0x1DDE98,
+				                   // bit 9: log the IOP->EE SIF0 deliveries and replay them after a restore, bit 10: keep the SIF DMA state live
 				u32 net_delay = 0;  // simulated one-way network delay of every outgoing packet, ms (can be changed while running)
 				u32 net_jitter = 0; // + a random 0..net_jitter ms
 				u32 net_drop = 0;   // simulated packet loss, percent
@@ -1654,6 +1660,31 @@ namespace Rollback
 			bool trace_active = false;
 			u32 trace_tick = 0, trace_bf = 0xFFFFFFFFu, trace_err_tick = 0, trace_noise = 0, trace_last358 = 0xFFFFFFFFu, trace_slot = 0, trace_last_state = 0x100;
 
+			// ---- SIF0 replay (debug bit 9 = 512). The IOP is not rolled back, so what it delivered to the EE between the snapshot
+			// and the rollback (SIF0 DMA data into EE RAM + the DMAC interrupt that makes the EE's SIF handler look at it) is lost
+			// with the restore and would never come again: RPC end notifications, loaded resources, ... Every delivery is logged with
+			// the battle frame and a sequence number; after a restore the deliveries newer than the snapshot are delivered again
+			// at the same frames of the re-simulation (the DMA data is copied back, the DMAC interrupt is raised again).
+			// debug bit 10 (1024): in addition the SIF DMA state itself (sif0/sif1 structures, DMAC channels 5/6, SBUS registers)
+			// is left as it is by a restore, like the IOP side.
+			struct SifEvt
+			{
+				u64 seq;
+				u32 frame;
+				u32 addr;
+				char kind; // 'W' data, 'I' interrupt
+				std::vector<u8> data;
+			};
+			std::deque<SifEvt> sif_log;
+			std::vector<SifEvt> sif_pending;
+			size_t sif_pending_pos = 0;
+			u64 sif_seq = 0;
+			u64 ring_seq[5] = {};
+			u32 cur_frame = 0;
+			bool sif_replaying = false;
+			u32 sif_logged_w = 0, sif_logged_i = 0, sif_replayed_w = 0, sif_replayed_i = 0;
+			bool g_sif0_log_flag = false;
+
 			// G3 (debug bit 5): the other three call sites of the comm master step 0x2F9A10 (0x1DCF84 is G2). The comm module's
 			// state words kept counting in a battle with only G2, so something else still runs it.
 			constexpr u32 kG3Sites[] = {0x156918, 0x1DD558, 0x1DDE98};
@@ -1697,6 +1728,79 @@ namespace Rollback
 			{
 				act = a;
 				Cpu->ExitExecution();
+			}
+
+			void SifLogWrite(u32 ee_addr, const void* data, u32 bytes)
+			{
+				if (st != St::Run || sif_replaying || (ee_addr & 0x80000000u) || bytes == 0 || bytes > 4u * 1024u * 1024u)
+					return;
+				const u32 a = ee_addr & 0x1FFFFFFFu;
+				if (a + bytes > 32u * 1024u * 1024u)
+					return;
+				SifEvt e;
+				e.seq = ++sif_seq;
+				e.frame = cur_frame;
+				e.addr = a;
+				e.kind = 'W';
+				e.data.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + bytes);
+				sif_log.push_back(std::move(e));
+				sif_logged_w++;
+			}
+
+			void SifLogIrq()
+			{
+				if (st != St::Run || sif_replaying)
+					return;
+				SifEvt e;
+				e.seq = ++sif_seq;
+				e.frame = cur_frame;
+				e.addr = 0;
+				e.kind = 'I';
+				sif_log.push_back(std::move(e));
+				sif_logged_i++;
+			}
+
+			void SifApply(const SifEvt& e)
+			{
+				sif_replaying = true;
+				if (e.kind == 'W')
+				{
+					std::memcpy(eeMem->Main + e.addr, e.data.data(), e.data.size());
+					sif_replayed_w++;
+				}
+				else
+				{
+					EEsif0Interrupt(); // what completing the transfer does: raise the DMAC interrupt, stop the channel
+					sif_replayed_i++;
+				}
+				sif_replaying = false;
+			}
+
+			// Delivers the pending replays that belong to frames up to F (all of them for kNoFrame).
+			void SifApplyUpTo(u32 F)
+			{
+				while (sif_pending_pos < sif_pending.size() && (F == 0xFFFFFFFFu || sif_pending[sif_pending_pos].frame <= F))
+					SifApply(sif_pending[sif_pending_pos++]);
+				if (sif_pending_pos >= sif_pending.size())
+				{
+					sif_pending.clear();
+					sif_pending_pos = 0;
+				}
+			}
+
+			void SifPrune(u32 ring_slots_valid_mask)
+			{
+				// events older than the oldest valid snapshot are never needed again
+				u64 oldest = ~0ull;
+				for (u32 i = 0; i < 5; i++)
+				{
+					if (ring_slots_valid_mask & (1u << i))
+						oldest = std::min(oldest, ring_seq[i]);
+				}
+				if (oldest == ~0ull)
+					return;
+				while (!sif_log.empty() && sif_log.front().seq <= oldest)
+					sif_log.pop_front();
 			}
 
 			void TracePush(char kind, u32 a, u32 b, u32 c)
@@ -1880,6 +1984,9 @@ namespace Rollback
 								"stalls %u (%.0f ms), snapshots %u, restore %.1f ms total, save %.1f ms total, packets in %u (bad %u) out %u (dropped %u), BF anomalies %u",
 					tag, live_frames, rollbacks, resim_frames, max_depth, pred_ok, pred_bad, stalls, ms_stall, saves, ms_restore, ms_save, pkts_in, pkts_bad, pkts_out,
 					pkts_dropped, anomalies);
+				if (sif_logged_w || sif_logged_i)
+					Console.WriteLn("RbNet: SIF0 deliveries logged: %u data + %u interrupts; replayed %u data + %u interrupts", sif_logged_w, sif_logged_i,
+						sif_replayed_w, sif_replayed_i);
 			}
 
 			void Stop(const char* why, bool revert = false)
@@ -1895,6 +2002,11 @@ namespace Rollback
 				RollbackNet::Close();
 				outq.clear();
 				g_FastSkipIop = false;
+				g_FastKeepSif = false;
+				Rollback::g_sif0_log = false;
+				sif_log.clear();
+				sif_pending.clear();
+				sif_pending_pos = 0;
 				st = St::Idle;
 				act = Act::None;
 				for (sess::Slot& s : ring)
@@ -2184,11 +2296,13 @@ namespace Rollback
 					anomalies++;
 				}
 				expect = F + 1;
+				cur_frame = F;
 
 				if (resim)
 				{
 					if (F < target)
 					{
+						SifApplyUpTo(F);
 						FlushSends();
 						WriteAll(F);
 						LogVerified(F, ptrs);
@@ -2196,6 +2310,7 @@ namespace Rollback
 						return;
 					}
 					resim = false; // back at the frame where the rollback was requested: this is a live hook again
+					SifApplyUpTo(0xFFFFFFFFu);
 					VMManager::SetLimiterMode(s_prev_limiter);
 				}
 
@@ -2347,6 +2462,16 @@ namespace Rollback
 						base = F;
 						expect = F + 1;
 						session++;
+						sif_log.clear();
+						sif_pending.clear();
+						sif_pending_pos = 0;
+						sif_seq = 0;
+						for (u64& q : ring_seq)
+							q = 0;
+						sif_logged_w = sif_logged_i = sif_replayed_w = sif_replayed_i = 0;
+						g_sif0_log_flag = (cfg.debug & 512) != 0;
+						g_FastKeepSif = (cfg.debug & 1024) != 0;
+						Rollback::g_sif0_log = g_sif0_log_flag;
 						if (cfg.debug & 16)
 							TraceArm(me);
 						last_state = 0x100;
@@ -2420,6 +2545,14 @@ namespace Rollback
 						}
 						s.frame = save_frame;
 						s.valid = true;
+						ring_seq[save_slot] = sif_seq;
+						if (g_sif0_log_flag)
+						{
+							u32 mask = 0;
+							for (u32 i = 0; i < kRing; i++)
+								mask |= ring[i].valid ? (1u << i) : 0u;
+							SifPrune(mask);
+						}
 						saves++;
 						ms_save += t.GetTimeMilliseconds();
 						break;
@@ -2443,6 +2576,23 @@ namespace Rollback
 						std::vector<u32> pre_words;
 						if (trace_active)
 							TraceWords(pre_words);
+						// debug bit 10: the SIF DMA state stays as it is (copy the live bytes aside, put them back after the restore)
+						struct HwRange
+						{
+							u32 lo, hi;
+						};
+						static constexpr HwRange kSifHw[] = {{0xC000, 0xC100}, {0xC400, 0xC500}, {0xF200, 0xF300}};
+						static std::vector<u8> sif_keep;
+						static std::vector<u8> sif_state_keep;
+						sif_keep.clear();
+						sif_state_keep.clear();
+						if (cfg.debug & 1024)
+						{
+							for (const HwRange& r : kSifHw)
+								sif_keep.insert(sif_keep.end(), eeHw + r.lo, eeHw + r.hi);
+							sif_state_keep.assign(reinterpret_cast<const u8*>(&sif0), reinterpret_cast<const u8*>(&sif0) + sizeof(sif0));
+							sif_state_keep.insert(sif_state_keep.end(), reinterpret_cast<const u8*>(&sif1), reinterpret_cast<const u8*>(&sif1) + sizeof(sif1));
+						}
 						static std::vector<u8> keep;
 						keep.clear();
 						if (cfg.debug & 8)
@@ -2464,6 +2614,31 @@ namespace Rollback
 								std::memcpy(eeMem->Main + r.lo, keep.data() + pos, r.hi - r.lo);
 								pos += r.hi - r.lo;
 							}
+						}
+						if (!sif_keep.empty())
+						{
+							size_t pos = 0;
+							for (const HwRange& r : kSifHw)
+							{
+								std::memcpy(eeHw + r.lo, sif_keep.data() + pos, r.hi - r.lo);
+								pos += r.hi - r.lo;
+							}
+							std::memcpy(&sif0, sif_state_keep.data(), sizeof(sif0));
+							std::memcpy(&sif1, sif_state_keep.data() + sizeof(sif0), sizeof(sif1));
+						}
+						if (g_sif0_log_flag)
+						{
+							// deliveries newer than the snapshot: those of the snapshot's own frame period come back now,
+							// the others at the hooks of their frames
+							const u64 from = ring_seq[roll_slot];
+							sif_pending.clear();
+							sif_pending_pos = 0;
+							for (const SifEvt& e : sif_log)
+							{
+								if (e.seq > from)
+									sif_pending.push_back(e);
+							}
+							SifApplyUpTo(s.frame);
 						}
 						if (trace_active)
 						{
@@ -2541,6 +2716,18 @@ namespace Rollback
 	bool IsSelfTestRunning()
 	{
 		return s_phase != Phase::Idle || sess::Active();
+	}
+
+	bool g_sif0_log = false;
+
+	void LogSif0Write(u32 ee_addr, const void* data, u32 bytes)
+	{
+		rn::SifLogWrite(ee_addr, data, bytes);
+	}
+
+	void LogSif0Irq()
+	{
+		rn::SifLogIrq();
 	}
 
 	void OnVSync()
