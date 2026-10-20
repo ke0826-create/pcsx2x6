@@ -1580,6 +1580,7 @@ namespace Rollback
 			bool resim = false;
 			u32 last_logged = kNoFrame;
 			u32 session = 0;      // counts the rollback sessions of this run (a new one starts for every battle)
+			u32 dump_bf = 0;      // when this battle frame is final, write the first 32 MB of EE RAM to rb_ram_dump_bf<N>.bin (file rb_dump_at.txt)
 			u32 last_state = 0x100; // last logged value of this slot's game state byte
 			u32 save_slot = 0, save_frame = 0, roll_slot = 0;
 			sess::Slot ring[kRing];
@@ -2114,6 +2115,19 @@ namespace Rollback
 				Console.WriteLn("RbNet: BF=%u s=%016llx u0=%.2f,%.2f,%.2f n=%u", F, static_cast<unsigned long long>(h),
 					first ? nb::RF(first + 0x60) : 0.0f, first ? nb::RF(first + 0x64) : 0.0f, first ? nb::RF(first + 0x68) : 0.0f, session);
 				last_logged = F;
+				if (dump_bf && F == dump_bf)
+				{
+					char name[64];
+					std::snprintf(name, sizeof(name), "rb_ram_dump_bf%u.bin", F);
+					std::FILE* df = std::fopen(name, "wb");
+					if (df)
+					{
+						std::fwrite(eeMem->Main, 1, 32u * 1024u * 1024u, df);
+						std::fclose(df);
+					}
+					Console.WriteLn("RbNet: EE RAM (32 MB) dumped at the final state of BF %u to %s", F, name);
+					dump_bf = 0;
+				}
 			}
 
 			void MaybeSave(u32 F)
@@ -2240,6 +2254,15 @@ namespace Rollback
 					// rb_net.txt is re-read while running: "0 ..." stops the session (the final statistics are logged); the
 					// artificial-lateness pattern and the simulated network (delay, jitter, loss) can be changed live, because
 					// they only change WHEN inputs become visible, never what the true inputs are.
+					if (std::FILE* df = std::fopen("rb_dump_at.txt", "r"))
+					{
+						unsigned x = 0;
+						if (std::fscanf(df, "%u", &x) == 1)
+							dump_bf = x;
+						std::fclose(df);
+						std::remove("rb_dump_at.txt");
+						Console.WriteLn("RbNet: EE RAM dump requested at BF %u", dump_bf);
+					}
 					const int old_pattern = cfg.pattern;
 					const u32 od = cfg.net_delay, oj = cfg.net_jitter, op = cfg.net_drop;
 					Cfg saved = cfg;
