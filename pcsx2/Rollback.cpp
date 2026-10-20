@@ -1686,6 +1686,8 @@ namespace Rollback
 			bool sif_replaying = false;
 			// EE write watch (see Rollback.h)
 			std::vector<std::pair<u32, u32>> watch_ranges;
+			u32 voice_limit = 0; // debug bit 4096: frames after which the operator voice (channel 3) is treated as finished; 0 = off
+			u32 voice_cuts = 0;
 			std::vector<std::pair<u32, u32>> user_keep; // rb_keep.txt: EE RAM ranges ("<lo> <hi>" hex) that a restore leaves as they are
 			std::vector<std::pair<u32, u32>> watch_sif_ranges; // lines "s <lo> <hi>": SIF0 (IOP -> EE DMA) deliveries and replays into them
 			std::FILE* watch_file = nullptr;
@@ -1761,6 +1763,51 @@ namespace Rollback
 						return false;
 				}
 				return true;
+			}
+
+			// Voice time limit. The operator message window lives as long as the voice channel 3 is "active" (0x151DE0(3): the channel
+			// table entry at 0x4B8860+3*8 names a voice record whose state is 3 = playing). The end of the voice is reported by the
+			// audio stream library (ADXT PLAYEND), which needs the IOP's playback progress; after an EE-only restore it can stay away
+			// forever and the window stays. Once the record has been playing for more than voice_limit frames the entry is released
+			// the way the game itself does it (both words -1, see 0x1525E0), which closes the window.
+			void VoiceReadConfig()
+			{
+				voice_limit = 0;
+				voice_cuts = 0;
+				if (!(cfg.debug & 4096))
+					return;
+				voice_limit = 360;
+				if (std::FILE* f = std::fopen("rb_voice.txt", "r"))
+				{
+					unsigned n = 0;
+					if (std::fscanf(f, "%u", &n) == 1 && n > 0)
+						voice_limit = n;
+					std::fclose(f);
+				}
+				Console.WriteLn("RbNet: operator voice time limit: %u frames", voice_limit);
+			}
+
+			void VoiceTimeout(u32 F)
+			{
+				if (!voice_limit)
+					return;
+				u8* m = eeMem->Main;
+				u32 idx = 0, ser = 0, state = 0;
+				std::memcpy(&idx, m + 0x4B8878, 4);
+				std::memcpy(&ser, m + 0x4B887C, 4);
+				if (idx > 2)
+					return; // -1 = nothing playing on the channel
+				const u32 rec = 0x4B8880 + idx * 0x5C;
+				u16 cnt = 0;
+				std::memcpy(&state, m + rec + 0xC, 4);
+				std::memcpy(&cnt, m + rec + 0x1C, 2);
+				if (state != 3 || cnt <= voice_limit)
+					return;
+				const u32 neg = 0xFFFFFFFFu;
+				std::memcpy(m + 0x4B8878, &neg, 4);
+				std::memcpy(m + 0x4B887C, &neg, 4);
+				if (voice_cuts++ < 8)
+					Console.WriteLn("RbNet: operator voice (record %u, serial %u) cut after %u frames at BF %u", idx, ser, static_cast<u32>(cnt), F);
 			}
 
 			void KeepReadConfig()
@@ -2207,6 +2254,8 @@ namespace Rollback
 								"stalls %u (%.0f ms), snapshots %u, restore %.1f ms total, save %.1f ms total, packets in %u (bad %u) out %u (dropped %u), BF anomalies %u",
 					tag, live_frames, rollbacks, resim_frames, max_depth, pred_ok, pred_bad, stalls, ms_stall, saves, ms_restore, ms_save, pkts_in, pkts_bad, pkts_out,
 					pkts_dropped, anomalies);
+				if (voice_limit)
+					Console.WriteLn("RbNet: operator voice cut %u times (limit %u frames)", voice_cuts, voice_limit);
 				if (sif_logged_w || sif_logged_i)
 				{
 					Console.WriteLn("RbNet: SIF0 deliveries logged: %u data + %u interrupts; replayed %u data + %u interrupts", sif_logged_w, sif_logged_i,
@@ -2298,6 +2347,7 @@ namespace Rollback
 				}
 				sess::WriteMailbox(4, 0);
 				sess::WriteMailbox(5, 0);
+				VoiceTimeout(F);
 			}
 
 			void PollNet()
@@ -2709,6 +2759,7 @@ namespace Rollback
 						sif_last_w_replay = true;
 						SifReadConfig();
 						KeepReadConfig();
+						VoiceReadConfig();
 						WatchReadConfig();
 						g_sif0_log_flag = (cfg.debug & 512) != 0;
 						g_FastKeepSif = (cfg.debug & 1024) != 0;
