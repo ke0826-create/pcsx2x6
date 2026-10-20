@@ -425,6 +425,9 @@
     <ClCompile Include="Rollback.cpp">
       <Filter>System</Filter>
     </ClCompile>
+    <ClCompile Include="RollbackNet.cpp">
+      <Filter>System</Filter>
+    </ClCompile>
     <ClCompile Include="SaveState.cpp">
       <Filter>System</Filter>
     </ClCompile>
@@ -1506,6 +1509,9 @@
       <Filter>System\Include</Filter>
     </ClInclude>
     <ClInclude Include="Rollback.h">
+      <Filter>System\Include</Filter>
+    </ClInclude>
+    <ClInclude Include="RollbackNet.h">
       <Filter>System\Include</Filter>
     </ClInclude>
     <ClInclude Include="SaveState.h">

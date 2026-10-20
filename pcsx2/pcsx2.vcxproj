@@ -426,6 +426,7 @@
     <ClCompile Include="windows\Optimus.cpp" />
     <ClCompile Include="Pcsx2Config.cpp" />
     <ClCompile Include="Rollback.cpp" />
+    <ClCompile Include="RollbackNet.cpp" />
     <ClCompile Include="SaveState.cpp" />
     <ClCompile Include="SourceLog.cpp" />
     <ClCompile Include="Elfheader.cpp" />
@@ -889,6 +890,7 @@
     <ClInclude Include="Common.h" />
     <ClInclude Include="Config.h" />
     <ClInclude Include="Rollback.h" />
+    <ClInclude Include="RollbackNet.h" />
     <ClInclude Include="SaveState.h" />
     <ClInclude Include="Counters.h" />
     <ClInclude Include="Dmac.h" />

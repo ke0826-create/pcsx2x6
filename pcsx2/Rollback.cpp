@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "Rollback.h"
+#include "RollbackNet.h"
 
 #include "Common.h"
 #include "Config.h"
@@ -17,10 +18,12 @@
 #include "common/Timer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1491,6 +1494,617 @@ namespace Rollback
 				return true;
 			}
 		} // namespace nb
+
+		// ======================================================================================
+		// Rollback netplay: input exchange between emulators + the rollback loop (rn)
+		// ======================================================================================
+		// Every emulator is one human slot of a networked battle. Once armed (file rb_net.txt, see Cfg) all emulators switch
+		// at the same battle frame `start` to: guest inputs from the mailbox (nb/sess patch G1), the game's own comm step
+		// stopped (G2). From then on this module runs the loop on every vsync hook, with F = the battle frame counter BF:
+		//   - the local input for frame F+L (L = input delay, in frames) is read now and sent to all peers over UDP
+		//     (every packet repeats the last kPacketFrames local inputs, so a lost datagram is covered by the next one);
+		//   - the mailbox word of every slot for frame F is the true input if it has arrived, else "hold the last known";
+		//   - when a true input arrives that differs from the word that was used, the state is restored from the newest
+		//     snapshot at or before that frame and the frames are re-simulated with the corrected inputs;
+		//   - if a peer is more than kMaxDepth frames behind, the hook waits for it (the only place that blocks).
+		// With `synthetic` set, the local input is a pure function of (slot, frame): the whole run is then reproducible and
+		// the per-frame state hashes ("RbNet: BF=.. s=..") of all emulators must be identical and independent of timing.
+		namespace rn
+		{
+			constexpr u32 kSlots = 4;
+			constexpr u32 kMaxFrames = 24000; // frames after the start frame that can be handled (400 s)
+			constexpr u32 kK = 4;             // snapshot interval
+			constexpr u32 kRing = 5;          // snapshots kept
+			constexpr u32 kMaxDepth = 10;     // wait when more than this many frames of a peer are predicted
+			constexpr u32 kPacketFrames = 12; // local inputs repeated in every packet
+			constexpr u32 kMagic = 0x31424E52u; // "RNB1"
+			constexpr u32 kPollEvery = 30;
+			constexpr u32 kNoFrame = 0xFFFFFFFFu;
+			constexpr u32 kMaxArtDelay = 8;
+			constexpr const char* kPeerIp = "127.0.0.1";
+
+			struct Packet
+			{
+				u32 magic;
+				u32 slot;
+				u32 first; // battle frame of words[0]
+				u32 count;
+				u32 words[kPacketFrames];
+			};
+
+			enum class St
+			{
+				Idle,
+				Armed,
+				Run,
+			};
+
+			enum class Act
+			{
+				None,
+				Begin,
+				Save,
+				Rollback,
+			};
+
+			struct Cfg
+			{
+				u32 enable = 0;
+				u32 slot = 0;
+				u32 port = 29100;  // peer of slot s listens on port + s
+				u32 delay = 2;     // L
+				int pattern = -1;  // artificial lateness of the peers' inputs (sess::kPatterns index), -1 = none
+				u32 synthetic = 1;
+				u32 start = 0;     // battle frame at which the rollback mode starts (same on all emulators)
+			};
+
+			St st = St::Idle;
+			Act act = Act::None;
+			Cfg cfg;
+			u32 polls = 0;
+			u32 consumed_start = kNoFrame;
+			u32 base = 0;
+			u32 me = 0;
+			u32 L = 2;
+			u32 expect = 0;
+			u32 target = 0;
+			bool resim = false;
+			u32 last_logged = kNoFrame;
+			u32 save_slot = 0, save_frame = 0, roll_slot = 0;
+			sess::Slot ring[kRing];
+			std::vector<u32> truth[kSlots];
+			std::vector<u32> recv_word[kSlots];
+			std::vector<u32> used[kSlots];
+			std::vector<u8> have[kSlots];
+			std::vector<u8> recvd[kSlots];
+			s32 kn[kSlots] = {};
+			// statistics
+			u32 rollbacks = 0, resim_frames = 0, max_depth = 0, saves = 0, pred_ok = 0, pred_bad = 0, stalls = 0, anomalies = 0;
+			u32 pkts_in = 0, pkts_bad = 0, live_frames = 0;
+			double ms_restore = 0.0, ms_save = 0.0, ms_stall = 0.0;
+
+			bool Active()
+			{
+				return st != St::Idle || act != Act::None;
+			}
+
+			void RequestAct(Act a)
+			{
+				act = a;
+				Cpu->ExitExecution();
+			}
+
+			void ReadConfig()
+			{
+				std::FILE* f = std::fopen("rb_net.txt", "r");
+				if (!f)
+					return;
+				unsigned enable = 0, slot = 0, port = 0, delay = 0, synthetic = 0, start = 0;
+				int pattern = -1;
+				const int n = std::fscanf(f, "%u %u %u %u %d %u %u", &enable, &slot, &port, &delay, &pattern, &synthetic, &start);
+				std::fclose(f);
+				if (n != 7)
+					return;
+				cfg.enable = enable;
+				cfg.slot = slot;
+				cfg.port = port;
+				cfg.delay = delay;
+				cfg.pattern = pattern;
+				cfg.synthetic = synthetic;
+				cfg.start = start;
+			}
+
+			// Idle: look for the config file every kPollEvery vsyncs.
+			void Poll()
+			{
+				if (st != St::Idle || (polls++ % kPollEvery))
+					return;
+				ReadConfig();
+				if (cfg.enable == 0 || cfg.start == consumed_start || cfg.slot >= kSlots || cfg.port == 0 || cfg.port > 65000 - kSlots)
+					return;
+				if (!RollbackNet::Open(static_cast<u16>(cfg.port + cfg.slot)))
+					return;
+				consumed_start = cfg.start;
+				me = cfg.slot;
+				L = std::max<u32>(1, std::min<u32>(cfg.delay, 8));
+				st = St::Armed;
+				Console.WriteLn("RbNet: armed: slot %u, UDP port %u, input delay %u, artificial pattern %d, synthetic inputs %u, start at BF %u",
+					me, cfg.port + me, L, cfg.pattern, cfg.synthetic, cfg.start);
+			}
+
+			void LogStats(const char* tag)
+			{
+				Console.WriteLn("RbNet: %s: live frames %u, rollbacks %u (frames re-simulated %u, deepest %u), predictions right %u / wrong %u, "
+								"stalls %u (%.0f ms), snapshots %u, restore %.1f ms total, save %.1f ms total, packets in %u (bad %u), BF anomalies %u",
+					tag, live_frames, rollbacks, resim_frames, max_depth, pred_ok, pred_bad, stalls, ms_stall, saves, ms_restore, ms_save, pkts_in, pkts_bad, anomalies);
+			}
+
+			void Stop(const char* why)
+			{
+				if (st == St::Idle)
+					return;
+				if (resim && VMManager::HasValidVM())
+					VMManager::SetLimiterMode(s_prev_limiter);
+				resim = false;
+				LogStats(why);
+				RollbackNet::Close();
+				st = St::Idle;
+				act = Act::None;
+				for (sess::Slot& s : ring)
+				{
+					s.snap = FastSnapshot();
+					s.valid = false;
+				}
+				// The guest patches stay in place: the game cannot go back to its own comm in the middle of a battle.
+				Console.WriteLn("RbNet: stopped (%s). The mailbox/comm-stop guest patches are still applied.", why);
+			}
+
+			u32 ArtDelay(u32 slot, u32 f)
+			{
+				if (cfg.pattern < 0 || cfg.pattern >= static_cast<int>(std::size(sess::kPatterns)))
+					return 0;
+				return std::min<u32>(sess::Delay(sess::kPatterns[cfg.pattern], f + slot * 7), kMaxArtDelay);
+			}
+
+			u32 Predict(u32 slot, u32 i)
+			{
+				for (u32 g = i; g > 0; g--)
+				{
+					if (have[slot][g - 1])
+						return truth[slot][g - 1];
+				}
+				return 0;
+			}
+
+			u32 InputFor(u32 slot, u32 i)
+			{
+				if (have[slot][i])
+					return truth[slot][i];
+				return (slot == me) ? 0 : Predict(slot, i);
+			}
+
+			// Writes the mailbox words of frame F (all slots) and remembers them.
+			void WriteAll(u32 F)
+			{
+				const u32 i = F - base;
+				for (u32 s = 0; s < kSlots; s++)
+				{
+					const u32 w = InputFor(s, i);
+					used[s][i] = w;
+					sess::WriteMailbox(s, w);
+				}
+				sess::WriteMailbox(4, 0);
+				sess::WriteMailbox(5, 0);
+			}
+
+			void PollNet()
+			{
+				u8 buf[256];
+				for (u32 guard = 0; guard < 256; guard++)
+				{
+					const int n = RollbackNet::Recv(buf, sizeof(buf));
+					if (n <= 0)
+						return;
+					Packet p;
+					if (n < 16)
+					{
+						pkts_bad++;
+						continue;
+					}
+					std::memcpy(&p, buf, std::min<size_t>(static_cast<size_t>(n), sizeof(p)));
+					if (p.magic != kMagic || p.slot >= kSlots || p.slot == me || p.count == 0 || p.count > kPacketFrames ||
+						static_cast<size_t>(n) < 16 + 4 * static_cast<size_t>(p.count))
+					{
+						pkts_bad++;
+						continue;
+					}
+					pkts_in++;
+					for (u32 k = 0; k < p.count; k++)
+					{
+						const u32 f = p.first + k;
+						if (f < base + L || f - base >= kMaxFrames)
+							continue;
+						const u32 i = f - base;
+						if (!recvd[p.slot][i])
+						{
+							recvd[p.slot][i] = 1;
+							recv_word[p.slot][i] = p.words[k];
+						}
+					}
+				}
+			}
+
+			// Makes the received inputs that are visible at frame F true. Returns the earliest frame (already run) whose used
+			// word was wrong, or kNoFrame. `force` ignores the artificial lateness (used while waiting).
+			u32 Deliver(u32 F, bool force)
+			{
+				u32 earliest = kNoFrame;
+				const u32 iF = F - base;
+				for (u32 s = 0; s < kSlots; s++)
+				{
+					if (s == me)
+						continue;
+					const u32 hi = std::min<u32>(iF + L + kPacketFrames, kMaxFrames - 1);
+					for (u32 i = static_cast<u32>(kn[s] + 1); i <= hi; i++)
+					{
+						if (have[s][i] || !recvd[s][i])
+							continue;
+						const u32 f = base + i;
+						if (!force && F + L < f + ArtDelay(s, f))
+							continue;
+						have[s][i] = 1;
+						truth[s][i] = recv_word[s][i];
+						if (f < F)
+						{
+							if (used[s][i] != truth[s][i])
+							{
+								pred_bad++;
+								earliest = std::min(earliest, f);
+							}
+							else
+							{
+								pred_ok++;
+							}
+						}
+					}
+					while (static_cast<u32>(kn[s] + 1) < kMaxFrames && have[s][kn[s] + 1])
+						kn[s]++;
+				}
+				return earliest;
+			}
+
+			u32 Depth(u32 F)
+			{
+				const s32 iF = static_cast<s32>(F - base);
+				s32 d = 0;
+				for (u32 s = 0; s < kSlots; s++)
+				{
+					if (s != me)
+						d = std::max(d, iF - kn[s]);
+				}
+				return static_cast<u32>(d);
+			}
+
+			// Reads the local input for frame F+L (once) and sends the last kPacketFrames local inputs to all peers.
+			void LocalStep(u32 F)
+			{
+				const u32 iL = F - base + L;
+				if (iL >= kMaxFrames)
+					return;
+				if (!have[me][iL])
+				{
+					truth[me][iL] = cfg.synthetic ? nb::NbWord(me, F + L) : sess::ReadDevice();
+					have[me][iL] = 1;
+				}
+				kn[me] = static_cast<s32>(iL);
+				Packet p{};
+				p.magic = kMagic;
+				p.slot = me;
+				s32 first = static_cast<s32>(iL) - static_cast<s32>(kPacketFrames) + 1;
+				if (first < static_cast<s32>(L))
+					first = static_cast<s32>(L);
+				p.count = static_cast<u32>(static_cast<s32>(iL) - first + 1);
+				p.first = base + static_cast<u32>(first);
+				for (u32 k = 0; k < p.count; k++)
+					p.words[k] = truth[me][static_cast<u32>(first) + k];
+				for (u32 s = 0; s < kSlots; s++)
+				{
+					if (s != me)
+						RollbackNet::SendTo(kPeerIp, static_cast<u16>(cfg.port + s), &p, static_cast<int>(16 + 4 * p.count));
+				}
+			}
+
+			// The state at hook F is final when every used word of the frames before F was a true one.
+			void LogVerified(u32 F, const u32* ptrs)
+			{
+				if (last_logged != kNoFrame && F <= last_logged)
+					return;
+				const s32 iPrev = static_cast<s32>(F - base) - 1;
+				for (u32 s = 0; s < kSlots; s++)
+				{
+					if (s != me && kn[s] < iPrev)
+						return;
+				}
+				u64 h = 1469598103934665603ull;
+				u32 first = 0;
+				for (u32 k = 0; k < 8; k++)
+				{
+					if (!ptrs[k])
+						continue;
+					if (!first)
+						first = ptrs[k];
+					static constexpr u32 kFields[4] = {0x60, 0x64, 0x68, 0x1F4};
+					for (const u32 off : kFields)
+						h = (h ^ nb::R32(ptrs[k] + off)) * 1099511628211ull;
+				}
+				Console.WriteLn("RbNet: BF=%u s=%016llx u0=%.2f,%.2f,%.2f", F, static_cast<unsigned long long>(h),
+					first ? nb::RF(first + 0x60) : 0.0f, first ? nb::RF(first + 0x64) : 0.0f, first ? nb::RF(first + 0x68) : 0.0f);
+				last_logged = F;
+			}
+
+			void MaybeSave(u32 F)
+			{
+				if (F > base && (F - base) % kK == 0)
+				{
+					save_slot = ((F - base) / kK) % kRing;
+					save_frame = F;
+					RequestAct(Act::Save);
+				}
+			}
+
+			void RequestRollback(u32 F, u32 mismatch_frame)
+			{
+				int best = -1;
+				for (u32 i = 0; i < kRing; i++)
+				{
+					if (ring[i].valid && ring[i].frame <= mismatch_frame && (best < 0 || ring[i].frame > ring[best].frame))
+						best = static_cast<int>(i);
+				}
+				if (best < 0)
+				{
+					Console.Error("RbNet: no snapshot at or before frame %u (now %u)", mismatch_frame, F);
+					Stop("no snapshot");
+					return;
+				}
+				for (u32 i = 0; i < kRing; i++)
+				{
+					if (ring[i].frame > ring[best].frame)
+						ring[i].valid = false;
+				}
+				roll_slot = static_cast<u32>(best);
+				target = F;
+				rollbacks++;
+				const u32 depth = F - ring[best].frame;
+				resim_frames += depth;
+				max_depth = std::max(max_depth, depth);
+				RequestAct(Act::Rollback);
+			}
+
+			void RunHook()
+			{
+				u32 F = 0;
+				u32 ptrs[8];
+				if (!nb::ReadBf(&F) || nb::Units(ptrs) < 2)
+				{
+					Stop("battle ended");
+					return;
+				}
+				if (F != expect)
+				{
+					if (anomalies < 8)
+						Console.Warning("RbNet: BF %u at this hook, expected %u", F, expect);
+					anomalies++;
+				}
+				expect = F + 1;
+
+				if (resim)
+				{
+					if (F < target)
+					{
+						WriteAll(F);
+						LogVerified(F, ptrs);
+						MaybeSave(F);
+						return;
+					}
+					resim = false; // back at the frame where the rollback was requested: this is a live hook again
+					VMManager::SetLimiterMode(s_prev_limiter);
+				}
+
+				if (F + L + kPacketFrames + 2 >= base + kMaxFrames)
+				{
+					Stop("buffer full");
+					return;
+				}
+
+				PollNet();
+				u32 m = Deliver(F, false);
+				if (m == kNoFrame && Depth(F) > kMaxDepth)
+				{
+					Common::Timer t;
+					stalls++;
+					while (m == kNoFrame && Depth(F) > kMaxDepth)
+					{
+						if (t.GetTimeMilliseconds() > 3000.0)
+						{
+							Stop("a peer was silent for 3 s");
+							return;
+						}
+						std::this_thread::sleep_for(std::chrono::milliseconds(1));
+						PollNet();
+						m = Deliver(F, true);
+					}
+					ms_stall += t.GetTimeMilliseconds();
+				}
+				if (m != kNoFrame)
+				{
+					RequestRollback(F, m);
+					return;
+				}
+
+				LogVerified(F, ptrs);
+				LocalStep(F);
+				WriteAll(F);
+				live_frames++;
+				if (live_frames % 600 == 0)
+					LogStats("progress");
+				if (live_frames % 60 == 0)
+				{
+					// "0 ..." as the first word of rb_net.txt stops the session (the final statistics are logged)
+					std::FILE* f = std::fopen("rb_net.txt", "r");
+					if (f)
+					{
+						unsigned enable = 1;
+						const int n = std::fscanf(f, "%u", &enable);
+						std::fclose(f);
+						if (n == 1 && enable == 0)
+						{
+							Stop("stopped by rb_net.txt");
+							return;
+						}
+					}
+				}
+				MaybeSave(F);
+			}
+
+			void OnHook()
+			{
+				if (act != Act::None)
+					return; // the CPU loop is about to exit
+				if (st == St::Armed)
+				{
+					u32 F = 0;
+					u32 ptrs[8];
+					if (!nb::ReadBf(&F) || nb::Units(ptrs) < 2)
+						return;
+					if (F > cfg.start)
+					{
+						Console.Error("RbNet: the start frame %u was missed (BF is already %u)", cfg.start, F);
+						RollbackNet::Close();
+						st = St::Idle;
+						return;
+					}
+					if (F == cfg.start)
+						RequestAct(Act::Begin);
+					return;
+				}
+				if (st == St::Run)
+					RunHook();
+			}
+
+			// Runs at the clean point. Returns true when a rollback-net action was handled.
+			bool OnExit()
+			{
+				if (act == Act::None)
+					return false;
+				const Act a = act;
+				act = Act::None;
+				if (!VMManager::HasValidVM() || VMManager::GetState() != VMState::Running)
+				{
+					Stop("execution interrupted");
+					return true;
+				}
+				Error error;
+				Common::Timer t;
+				switch (a)
+				{
+					case Act::Begin:
+					{
+						u32 F = 0;
+						nb::ReadBf(&F);
+						if (F != cfg.start || RamSize() < sess::kMailbox + 6 * sess::kMailboxStride)
+						{
+							Console.Error("RbNet: cannot begin (BF %u, start %u, RAM %u MB)", F, cfg.start, RamSize() >> 20);
+							RollbackNet::Close();
+							st = St::Idle;
+							return true;
+						}
+						MeasureRamUse();
+						base = F;
+						expect = F + 1;
+						for (u32 s = 0; s < kSlots; s++)
+						{
+							truth[s].assign(kMaxFrames, 0);
+							recv_word[s].assign(kMaxFrames, 0);
+							used[s].assign(kMaxFrames, 0);
+							have[s].assign(kMaxFrames, 0);
+							recvd[s].assign(kMaxFrames, 0);
+							for (u32 i = 0; i < L; i++)
+								have[s][i] = recvd[s][i] = 1; // the first L frames are defined as "no input" for everybody
+							kn[s] = static_cast<s32>(L) - 1;
+						}
+						rollbacks = resim_frames = max_depth = saves = pred_ok = pred_bad = stalls = anomalies = 0;
+						pkts_in = pkts_bad = live_frames = 0;
+						ms_restore = ms_save = ms_stall = 0.0;
+						last_logged = kNoFrame;
+						resim = false;
+						for (sess::Slot& s : ring)
+							s.valid = false;
+						if (!sess::ApplyGuestPatch(true))
+						{
+							Stop("input patch failed");
+							return true;
+						}
+						if (!nb::ApplyG2(true))
+						{
+							Stop("comm-stop patch failed");
+							return true;
+						}
+						s_prev_limiter = VMManager::GetLimiterMode();
+						LocalStep(F);
+						WriteAll(F);
+						ring[0].snap.ee_regions = s_regions;
+						if (!SaveState_FastSave(ring[0].snap, false, &error))
+						{
+							Console.Error("RbNet: first snapshot failed: %s", error.GetDescription().c_str());
+							Stop("save failed");
+							return true;
+						}
+						ring[0].frame = F;
+						ring[0].valid = true;
+						st = St::Run;
+						const u32 ctx = nb::R32(nb::kGpBase - 0x7D20);
+						Console.WriteLn("RbNet: running from BF %u (guest ctx local slot %u, configured slot %u)", F,
+							nb::Plausible(ctx) ? nb::R8(ctx + 0x1D) : 0xFFu, me);
+						break;
+					}
+					case Act::Save:
+					{
+						sess::Slot& s = ring[save_slot];
+						s.snap.ee_regions = s_regions;
+						if (!SaveState_FastSave(s.snap, false, &error))
+						{
+							Console.Error("RbNet: snapshot save failed: %s", error.GetDescription().c_str());
+							Stop("save failed");
+							return true;
+						}
+						s.frame = save_frame;
+						s.valid = true;
+						saves++;
+						ms_save += t.GetTimeMilliseconds();
+						break;
+					}
+					case Act::Rollback:
+					{
+						sess::Slot& s = ring[roll_slot];
+						if (!SaveState_FastLoad(s.snap, FastLoadMode::Diff, false, nullptr, &error))
+						{
+							Console.Error("RbNet: restore failed: %s", error.GetDescription().c_str());
+							Stop("restore failed");
+							return true;
+						}
+						ms_restore += t.GetTimeMilliseconds();
+						expect = s.frame + 1;
+						resim = true;
+						VMManager::SetLimiterMode(LimiterModeType::Unlimited);
+						WriteAll(s.frame); // the word of the snapshot's own frame, now with the corrected input
+						break;
+					}
+					case Act::None:
+						break;
+				}
+				return true;
+			}
+		} // namespace rn
 	} // namespace
 
 	void RequestSelfTest()
@@ -1537,6 +2151,14 @@ namespace Rollback
 				sess::OnHook();
 			return;
 		}
+		if (rn::Active())
+		{
+			if (!VMManager::HasValidVM())
+				rn::Stop("VM went away");
+			else
+				rn::OnHook();
+			return;
+		}
 		if (s_phase == Phase::Idle && sess::requested)
 		{
 			sess::requested = false;
@@ -1552,6 +2174,7 @@ namespace Rollback
 		if (s_phase == Phase::Idle)
 		{
 			nb::OnHook();
+			rn::Poll();
 			if (s_requested)
 			{
 				if (VMManager::HasValidVM())
@@ -1601,6 +2224,8 @@ namespace Rollback
 	void OnExecutionExit()
 	{
 		if (sess::OnExit())
+			return;
+		if (rn::OnExit())
 			return;
 		if (nb::OnExit())
 			return;
