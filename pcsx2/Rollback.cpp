@@ -28,6 +28,7 @@
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <map>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1673,6 +1674,7 @@ namespace Rollback
 				u32 frame;
 				u32 addr;
 				char kind; // 'W' data, 'I' interrupt
+				bool replay = true; // false = logged only (statistics), never replayed (outside the include / inside an exclude range)
 				std::vector<u8> data;
 			};
 			std::deque<SifEvt> sif_log;
@@ -1682,6 +1684,12 @@ namespace Rollback
 			u64 ring_seq[5] = {};
 			u32 cur_frame = 0;
 			bool sif_replaying = false;
+			// rb_sif.txt (read when the session begins): lines "i <lo> <hi>" / "e <lo> <hi>" (hex EE addresses). With include ranges only the
+			// deliveries into them are replayed, otherwise all except those into an exclude range. The interrupt of a transfer follows the
+			// decision of the last data chunk before it.
+			std::vector<std::pair<u32, u32>> sif_inc, sif_exc;
+			bool sif_last_w_replay = true;
+			std::map<u32, std::pair<u32, u64>> sif_hist; // 64 KB region -> (chunks, bytes) of the logged deliveries
 			u32 sif_logged_w = 0, sif_logged_i = 0, sif_replayed_w = 0, sif_replayed_i = 0;
 			bool g_sif0_log_flag = false;
 
@@ -1730,6 +1738,45 @@ namespace Rollback
 				Cpu->ExitExecution();
 			}
 
+			bool SifRangeReplay(u32 a)
+			{
+				if (!sif_inc.empty())
+				{
+					for (const auto& r : sif_inc)
+					{
+						if (a >= r.first && a < r.second)
+							return true;
+					}
+					return false;
+				}
+				for (const auto& r : sif_exc)
+				{
+					if (a >= r.first && a < r.second)
+						return false;
+				}
+				return true;
+			}
+
+			void SifReadConfig()
+			{
+				sif_inc.clear();
+				sif_exc.clear();
+				std::FILE* f = std::fopen("rb_sif.txt", "r");
+				if (!f)
+					return;
+				char c = 0;
+				unsigned lo = 0, hi = 0;
+				while (std::fscanf(f, " %c %x %x", &c, &lo, &hi) == 3)
+				{
+					if (c == 'i' || c == 'I')
+						sif_inc.emplace_back(lo, hi);
+					else if (c == 'e' || c == 'E')
+						sif_exc.emplace_back(lo, hi);
+				}
+				std::fclose(f);
+				Console.WriteLn("RbNet: rb_sif.txt: %u include and %u exclude ranges", static_cast<u32>(sif_inc.size()), static_cast<u32>(sif_exc.size()));
+			}
+
 			void SifLogWrite(u32 ee_addr, const void* data, u32 bytes)
 			{
 				if (st != St::Run || sif_replaying || (ee_addr & 0x80000000u) || bytes == 0 || bytes > 4u * 1024u * 1024u)
@@ -1742,6 +1789,11 @@ namespace Rollback
 				e.frame = cur_frame;
 				e.addr = a;
 				e.kind = 'W';
+				e.replay = SifRangeReplay(a);
+				sif_last_w_replay = e.replay;
+				auto& hh = sif_hist[a >> 16];
+				hh.first++;
+				hh.second += bytes;
 				e.data.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + bytes);
 				sif_log.push_back(std::move(e));
 				sif_logged_w++;
@@ -1756,6 +1808,7 @@ namespace Rollback
 				e.frame = cur_frame;
 				e.addr = 0;
 				e.kind = 'I';
+				e.replay = sif_last_w_replay;
 				sif_log.push_back(std::move(e));
 				sif_logged_i++;
 			}
@@ -1985,8 +2038,18 @@ namespace Rollback
 					tag, live_frames, rollbacks, resim_frames, max_depth, pred_ok, pred_bad, stalls, ms_stall, saves, ms_restore, ms_save, pkts_in, pkts_bad, pkts_out,
 					pkts_dropped, anomalies);
 				if (sif_logged_w || sif_logged_i)
+				{
 					Console.WriteLn("RbNet: SIF0 deliveries logged: %u data + %u interrupts; replayed %u data + %u interrupts", sif_logged_w, sif_logged_i,
 						sif_replayed_w, sif_replayed_i);
+					// the 12 busiest 64 KB regions of the logged deliveries (chunks, KB)
+					std::vector<std::pair<u32, u32>> top; // chunks, region
+					for (const auto& kv : sif_hist)
+						top.emplace_back(kv.second.first, kv.first);
+					std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+					for (size_t i = 0; i < top.size() && i < 12; i++)
+						Console.WriteLn("RbNet:   SIF0 into 0x%06X-0x%06X: %u chunks, %u KB", top[i].second << 16, (top[i].second << 16) + 0xFFFF, top[i].first,
+							static_cast<u32>(sif_hist[top[i].second].second >> 10));
+				}
 			}
 
 			void Stop(const char* why, bool revert = false)
@@ -2469,6 +2532,9 @@ namespace Rollback
 						for (u64& q : ring_seq)
 							q = 0;
 						sif_logged_w = sif_logged_i = sif_replayed_w = sif_replayed_i = 0;
+						sif_hist.clear();
+						sif_last_w_replay = true;
+						SifReadConfig();
 						g_sif0_log_flag = (cfg.debug & 512) != 0;
 						g_FastKeepSif = (cfg.debug & 1024) != 0;
 						Rollback::g_sif0_log = g_sif0_log_flag;
@@ -2635,7 +2701,7 @@ namespace Rollback
 							sif_pending_pos = 0;
 							for (const SifEvt& e : sif_log)
 							{
-								if (e.seq > from)
+								if (e.seq > from && e.replay)
 									sif_pending.push_back(e);
 							}
 							SifApplyUpTo(s.frame);
