@@ -807,7 +807,7 @@ int isBreakpointNeeded(u32 addr)
 
 int isMemcheckNeeded(u32 pc)
 {
-	if (Rollback::g_watch_jit && ((pc >= 0x150000 && pc < 0x1A0000)))
+	if (Rollback::g_watch_jit && ((pc >= 0x100000 && pc < 0x1A0000)))
 	{
 		u32 a = pc;
 		if (isBranchOrJump(a))

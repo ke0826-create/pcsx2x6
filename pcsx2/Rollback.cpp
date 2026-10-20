@@ -1766,7 +1766,7 @@ namespace Rollback
 				if (Rollback::g_watch_jit)
 				{
 					Rollback::g_watch_jit = false;
-					Cpu->Clear(0x150000, 0x50000 / 4); // compile the sound/HUD code normally again
+					Cpu->Clear(0x100000, 0xA0000 / 4); // compile the sound/HUD code normally again
 				}
 				Rollback::g_watch_on = false;
 				if (watch_file)
@@ -1795,7 +1795,7 @@ namespace Rollback
 				if (Rollback::g_watch_on)
 				{
 					Rollback::g_watch_jit = true;
-					Cpu->Clear(0x150000, 0x50000 / 4); // recompile the sound/HUD code with the store hooks
+					Cpu->Clear(0x100000, 0xA0000 / 4); // recompile the sound/HUD code with the store hooks
 				}
 				Console.WriteLn("RbNet: EE write watch on: %u ranges", static_cast<u32>(watch_ranges.size()));
 			}
