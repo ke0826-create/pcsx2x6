@@ -1631,15 +1631,154 @@ namespace Rollback
 			}
 			double ms_restore = 0.0, ms_save = 0.0, ms_stall = 0.0;
 
+			// ---- Communication-module trace (debug bit 4, or the file rb_trace.txt in a battle WITHOUT rollback): which words of
+			// the comm module's control data change, when, and what the restores do to them. When the error code (0x630358) appears
+			// (or the file rb_trace_dump_now.txt exists) the recent history is written to rb_trace_dump.txt.
+			struct TraceRange
+			{
+				u32 lo, hi;
+			};
+			constexpr TraceRange kTraceRanges[] = {{0x630000, 0x630400}, {0x4A08E0, 0x4A08F0}, {0x4A0A30, 0x4A0BE0}, {0x4A6F00, 0x4A7000}};
+			constexpr u32 kNoiseLo = 0x628000, kNoiseHi = 0x636000; // the comm module's buffers: only counted
+			constexpr u32 kTraceMax = 8000;
+			struct TraceRec
+			{
+				u32 tick, bf, a, b, c;
+				char kind;
+			};
+			std::deque<TraceRec> trace;
+			std::vector<u32> trace_prev, noise_prev;
+			bool trace_active = false;
+			u32 trace_tick = 0, trace_bf = 0xFFFFFFFFu, trace_err_tick = 0, trace_noise = 0, trace_last358 = 0xFFFFFFFFu, trace_slot = 0, trace_last_state = 0x100;
+
 			bool Active()
 			{
-				return st != St::Idle || act != Act::None;
+				return st != St::Idle || act != Act::None || trace_active;
 			}
 
 			void RequestAct(Act a)
 			{
 				act = a;
 				Cpu->ExitExecution();
+			}
+
+			void TracePush(char kind, u32 a, u32 b, u32 c)
+			{
+				trace.push_back({trace_tick, trace_bf, a, b, c, kind});
+				while (trace.size() > kTraceMax)
+					trace.pop_front();
+			}
+
+			void TraceWords(std::vector<u32>& out)
+			{
+				out.clear();
+				for (const TraceRange& r : kTraceRanges)
+				{
+					for (u32 a = r.lo; a < r.hi; a += 4)
+						out.push_back(nb::R32(a));
+				}
+			}
+
+			void TraceArm(u32 slot)
+			{
+				if (trace_active)
+					return;
+				trace_active = true;
+				trace.clear();
+				trace_tick = 0;
+				trace_err_tick = 0;
+				trace_noise = 0;
+				trace_slot = slot;
+				trace_last_state = 0x100;
+				TraceWords(trace_prev);
+				noise_prev.clear();
+				for (u32 a = kNoiseLo; a < kNoiseHi; a += 4)
+					noise_prev.push_back(nb::R32(a));
+				trace_last358 = nb::R32(0x630358);
+				TracePush('A', slot, 0, 0);
+				Console.WriteLn("RbTrace: armed (slot %u): %u control words + %u buffer words watched", slot, static_cast<u32>(trace_prev.size()),
+					static_cast<u32>(noise_prev.size()));
+			}
+
+			void TraceDump(const char* reason)
+			{
+				std::FILE* f = std::fopen("rb_trace_dump.txt", "w");
+				if (f)
+				{
+					std::fprintf(f, "# comm trace dump (%s): tick bf kind a b c\n", reason);
+					for (const TraceRec& r : trace)
+						std::fprintf(f, "%u %u %c %08X %08X %08X\n", r.tick, r.bf, r.kind, r.a, r.b, r.c);
+					std::fclose(f);
+				}
+				Console.WriteLn("RbTrace: dumped %u records to rb_trace_dump.txt (%s)", static_cast<u32>(trace.size()), reason);
+				trace_active = false;
+			}
+
+			// Once per hook (also during re-simulation: those changes are logged in lower case).
+			void TraceStep(bool in_resim)
+			{
+				trace_tick++;
+				u32 F = 0;
+				trace_bf = nb::ReadBf(&F) ? F : 0xFFFFFFFFu;
+				size_t idx = 0;
+				for (const TraceRange& r : kTraceRanges)
+				{
+					for (u32 a = r.lo; a < r.hi; a += 4, idx++)
+					{
+						const u32 v = nb::R32(a);
+						if (v != trace_prev[idx])
+						{
+							TracePush(in_resim ? 'c' : 'C', a, trace_prev[idx], v);
+							trace_prev[idx] = v;
+						}
+					}
+				}
+				u32 changed = 0;
+				idx = 0;
+				for (u32 a = kNoiseLo; a < kNoiseHi; a += 4, idx++)
+				{
+					const u32 v = nb::R32(a);
+					if (v != noise_prev[idx])
+					{
+						noise_prev[idx] = v;
+						changed++;
+					}
+				}
+				trace_noise += changed;
+				if (trace_tick % 30 == 0)
+				{
+					TracePush('N', trace_noise, 0, 0);
+					trace_noise = 0;
+				}
+				const u32 gs = nb::R8(0x5ED060 + 0x50 * trace_slot);
+				if (gs != trace_last_state)
+				{
+					TracePush('G', gs, trace_last_state & 0xFF, 0);
+					trace_last_state = gs;
+				}
+				const u32 e = nb::R32(0x630358);
+				if (e != trace_last358)
+				{
+					TracePush('E', 0x630358, trace_last358, e);
+					if (trace_last358 == 0xFFFFFFFFu && e != 0xFFFFFFFFu && trace_err_tick == 0)
+						trace_err_tick = trace_tick;
+					trace_last358 = e;
+				}
+				if (trace_err_tick && trace_tick >= trace_err_tick + 120)
+				{
+					TraceDump("error code appeared");
+					return;
+				}
+				if (trace_tick % 60 == 0)
+				{
+					std::FILE* f = std::fopen("rb_trace_dump_now.txt", "r");
+					if (f)
+					{
+						std::fclose(f);
+						std::remove("rb_trace_dump_now.txt");
+						TraceDump("requested");
+					}
+				}
 			}
 
 			void ReadConfig()
@@ -1671,6 +1810,20 @@ namespace Rollback
 			{
 				if (st != St::Idle || (polls++ % kPollEvery))
 					return;
+				if (!trace_active)
+				{
+					std::FILE* tf = std::fopen("rb_trace.txt", "r");
+					if (tf)
+					{
+						unsigned tslot = 0;
+						if (std::fscanf(tf, "%u", &tslot) != 1)
+							tslot = 0;
+						std::fclose(tf);
+						std::remove("rb_trace.txt");
+						TraceArm(tslot);
+						return;
+					}
+				}
 				ReadConfig();
 				if (cfg.enable == 0 || cfg.start == consumed_start || cfg.slot >= kSlots || cfg.port == 0 || cfg.port > 65000 - kSlots)
 					return;
@@ -1696,6 +1849,8 @@ namespace Rollback
 			{
 				if (st == St::Idle)
 					return;
+				if (trace_active)
+					TracePush('S', revert ? 1 : 0, 0, 0);
 				if (resim && VMManager::HasValidVM())
 					VMManager::SetLimiterMode(s_prev_limiter);
 				resim = false;
@@ -2079,6 +2234,8 @@ namespace Rollback
 			{
 				if (act != Act::None)
 					return; // the CPU loop is about to exit
+				if (trace_active)
+					TraceStep(resim);
 				if (st == St::Armed)
 				{
 					u32 F = 0;
@@ -2131,6 +2288,8 @@ namespace Rollback
 						base = F;
 						expect = F + 1;
 						session++;
+						if (cfg.debug & 16)
+							TraceArm(me);
 						last_state = 0x100;
 						for (u32 s = 0; s < kSlots; s++)
 						{
@@ -2216,6 +2375,9 @@ namespace Rollback
 							{0x4A0A30, 0x4A0BE0},
 							{0x4A6F00, 0x4A7000}, // SIF RPC bookkeeping seen changing at the connection loss
 						};
+						std::vector<u32> pre_words;
+						if (trace_active)
+							TraceWords(pre_words);
 						static std::vector<u8> keep;
 						keep.clear();
 						if (cfg.debug & 8)
@@ -2237,6 +2399,26 @@ namespace Rollback
 								std::memcpy(eeMem->Main + r.lo, keep.data() + pos, r.hi - r.lo);
 								pos += r.hi - r.lo;
 							}
+						}
+						if (trace_active)
+						{
+							// what the restore did to the comm control words (live value before -> value after)
+							u32 changed = 0;
+							size_t idx = 0;
+							for (const TraceRange& r : kTraceRanges)
+							{
+								for (u32 a = r.lo; a < r.hi; a += 4, idx++)
+								{
+									const u32 v = nb::R32(a);
+									if (v != pre_words[idx])
+									{
+										TracePush('D', a, pre_words[idx], v);
+										changed++;
+									}
+								}
+							}
+							TracePush('R', s.frame, target - s.frame, changed);
+							TraceWords(trace_prev);
 						}
 						ms_restore += t.GetTimeMilliseconds();
 						expect = s.frame + 1;
