@@ -1227,8 +1227,7 @@ namespace Rollback
 				std::FILE* f = std::fopen("nb_status.txt", "w");
 				if (!f)
 					return;
-				std::fprintf(f, "%u %u %u %u %u %u
-", ctl[STATUS], ctl[BF_G1], ctl[BF_G2], ctl[LOGGED], ctl[CMD], ctl[HEARTBEAT]);
+				std::fprintf(f, "%u %u %u %u %u %u\n", ctl[STATUS], ctl[BF_G1], ctl[BF_G2], ctl[LOGGED], ctl[CMD], ctl[HEARTBEAT]);
 				std::fclose(f);
 			}
 
@@ -1244,10 +1243,6 @@ namespace Rollback
 			u8 R8(u32 a)
 			{
 				return eeMem->Main[a];
-			}
-			void W32(u32 a, u32 v)
-			{
-				*reinterpret_cast<u32*>(eeMem->Main + a) = v;
 			}
 			float RF(u32 a)
 			{
