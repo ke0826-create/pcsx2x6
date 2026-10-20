@@ -1560,7 +1560,8 @@ namespace Rollback
 				u32 start = 0;     // battle frame at which the rollback mode starts (same on all emulators)
 				u32 debug = 0;     // bit 0: take no snapshots, bit 1: never restore (mispredictions are ignored), bit 2: EE-only snapshots (IOP is not rolled back),
 				                   // bit 3: keep the game's comm module data (EE RAM) live: a restore does not rewind it,
-				                   // bit 4: comm-module trace, bit 5: also stop the other call sites of the comm master step (G3)
+				                   // bit 4: comm-module trace, bit 5: also stop the other call sites of the comm master step (G3);
+				                   // bits 6/7/8: only the G3 site 0x156918 / 0x1DD558 / 0x1DDE98
 				u32 net_delay = 0;  // simulated one-way network delay of every outgoing packet, ms (can be changed while running)
 				u32 net_jitter = 0; // + a random 0..net_jitter ms
 				u32 net_drop = 0;   // simulated packet loss, percent
@@ -1655,23 +1656,34 @@ namespace Rollback
 			// G3 (debug bit 5): the other three call sites of the comm master step 0x2F9A10 (0x1DCF84 is G2). The comm module's
 			// state words kept counting in a battle with only G2, so something else still runs it.
 			constexpr u32 kG3Sites[] = {0x156918, 0x1DD558, 0x1DDE98};
-			bool g3_applied = false;
+			u32 g3_mask = 0; // bit i = kG3Sites[i] is patched at the moment
 
-			bool ApplyG3(bool on)
+			// debug bit 5 (32) = all three sites; otherwise bits 6, 7, 8 (64, 128, 256) pick the sites one by one.
+			u32 G3MaskFromDebug(u32 debug)
 			{
-				for (const u32 a : kG3Sites)
+				return (debug & 32) ? 7u : ((debug >> 6) & 7u);
+			}
+
+			bool ApplyG3(bool on, u32 mask)
+			{
+				for (u32 i = 0; i < 3; i++)
 				{
-					const u32 now = nb::R32(a);
+					if (!(mask & (1u << i)))
+						continue;
+					const u32 now = nb::R32(kG3Sites[i]);
 					const u32 expect = on ? nb::kG2Original : nb::kG2Patched;
 					if (now != expect)
 					{
-						Console.Error("RbNet: G3 site 0x%06X is 0x%08X, expected 0x%08X", a, now, expect);
+						Console.Error("RbNet: G3 site 0x%06X is 0x%08X, expected 0x%08X", kG3Sites[i], now, expect);
 						return false;
 					}
 				}
-				for (const u32 a : kG3Sites)
-					*reinterpret_cast<u32*>(eeMem->Main + a) = on ? nb::kG2Patched : nb::kG2Original;
-				g3_applied = on;
+				for (u32 i = 0; i < 3; i++)
+				{
+					if (mask & (1u << i))
+						*reinterpret_cast<u32*>(eeMem->Main + kG3Sites[i]) = on ? nb::kG2Patched : nb::kG2Original;
+				}
+				g3_mask = on ? mask : 0;
 				return true;
 			}
 
@@ -2345,11 +2357,12 @@ namespace Rollback
 							Stop("comm-stop patch failed");
 							return true;
 						}
-						if ((cfg.debug & 32) && !ApplyG3(true))
+						if (G3MaskFromDebug(cfg.debug) && !ApplyG3(true, G3MaskFromDebug(cfg.debug)))
 						{
 							Stop("G3 patch failed");
 							return true;
 						}
+						Console.WriteLn("RbNet: comm-step call sites stopped: G2 (0x1DCF84) + G3 mask %u", g3_mask);
 						s_prev_limiter = VMManager::GetLimiterMode();
 						g_FastSkipIop = (cfg.debug & 4) != 0;
 						LocalStep(F);
@@ -2459,8 +2472,8 @@ namespace Rollback
 					case Act::Cleanup:
 					{
 						const bool ok1 = nb::ApplyG2(false);
-						if (g3_applied)
-							ApplyG3(false);
+						if (g3_mask)
+							ApplyG3(false, g3_mask);
 						const bool ok2 = sess::ApplyGuestPatch(false);
 						Console.WriteLn("RbNet: guest patches reverted after the battle (comm stop %s, input mailbox %s)", ok1 ? "ok" : "FAILED", ok2 ? "ok" : "FAILED");
 						break;
