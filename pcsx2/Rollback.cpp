@@ -2104,6 +2104,15 @@ namespace Rollback
 			{
 				if (st != St::Idle || (polls++ % kPollEvery))
 					return;
+				if (!Rollback::g_watch_on)
+				{
+					// EE write watch without a rollback session (to look at plain netplay): rb_watch.txt alone starts it
+					if (std::FILE* wf = std::fopen("rb_watch.txt", "r"))
+					{
+						std::fclose(wf);
+						WatchReadConfig();
+					}
+				}
 				if (!trace_active)
 				{
 					std::FILE* tf = std::fopen("rb_trace.txt", "r");
