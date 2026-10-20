@@ -1558,7 +1558,8 @@ namespace Rollback
 				int pattern = -1;  // artificial lateness of the peers' inputs (sess::kPatterns index), -1 = none
 				u32 synthetic = 1;
 				u32 start = 0;     // battle frame at which the rollback mode starts (same on all emulators)
-				u32 debug = 0;     // bit 0: take no snapshots, bit 1: never restore (mispredictions are ignored), bit 2: EE-only snapshots (IOP is not rolled back)
+				u32 debug = 0;     // bit 0: take no snapshots, bit 1: never restore (mispredictions are ignored), bit 2: EE-only snapshots (IOP is not rolled back),
+				                   // bit 3: keep the game's comm module data (EE RAM) live: a restore does not rewind it
 				u32 net_delay = 0;  // simulated one-way network delay of every outgoing packet, ms (can be changed while running)
 				u32 net_jitter = 0; // + a random 0..net_jitter ms
 				u32 net_drop = 0;   // simulated packet loss, percent
@@ -2202,11 +2203,40 @@ namespace Rollback
 					case Act::Rollback:
 					{
 						sess::Slot& s = ring[roll_slot];
+						// The comm module's EE-side data is the other half of what the (not rewound) IOP network stack and the peers
+						// know: its receive buffers/connection state are written by the IOP asynchronously. A rewind of it makes the
+						// game report a communication error as soon as it uses the comm again (end of the battle). Keep it live.
+						struct KeepRange
+						{
+							u32 lo, hi;
+						};
+						static constexpr KeepRange kKeep[] = {
+							{0x628000, 0x636000}, // the comm module's data/buffers (lui 0x62/0x63 references of the module at 0x2F0000-0x300000)
+							{0x4A08E0, 0x4A08F0}, // its gp-relative variables
+							{0x4A0A30, 0x4A0BE0},
+							{0x4A6F00, 0x4A7000}, // SIF RPC bookkeeping seen changing at the connection loss
+						};
+						static std::vector<u8> keep;
+						keep.clear();
+						if (cfg.debug & 8)
+						{
+							for (const KeepRange& r : kKeep)
+								keep.insert(keep.end(), eeMem->Main + r.lo, eeMem->Main + r.hi);
+						}
 						if (!SaveState_FastLoad(s.snap, FastLoadMode::Diff, false, nullptr, &error))
 						{
 							Console.Error("RbNet: restore failed: %s", error.GetDescription().c_str());
 							Stop("restore failed");
 							return true;
+						}
+						if (!keep.empty())
+						{
+							size_t pos = 0;
+							for (const KeepRange& r : kKeep)
+							{
+								std::memcpy(eeMem->Main + r.lo, keep.data() + pos, r.hi - r.lo);
+								pos += r.hi - r.lo;
+							}
 						}
 						ms_restore += t.GetTimeMilliseconds();
 						expect = s.frame + 1;
