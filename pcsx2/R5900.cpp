@@ -807,13 +807,13 @@ int isBreakpointNeeded(u32 addr)
 
 int isMemcheckNeeded(u32 pc)
 {
-	if (Rollback::g_watch_jit && ((pc >= 0x160000 && pc < 0x1A0000) || (pc >= 0x151D60 && pc < 0x151F00)))
+	if (Rollback::g_watch_jit && ((pc >= 0x150000 && pc < 0x1A0000)))
 	{
 		u32 a = pc;
 		if (isBranchOrJump(a))
 			a += 4;
 		const OPCODE& wop = GetInstruction(memRead32(a));
-		// stores in the HUD code; loads and stores in the message-channel status code (0x151D60-0x151F00)
+		// stores in the sound/HUD code (0x150000-0x1A0000); loads in the message-channel status code (0x151D60-0x151F00)
 		if ((wop.flags & IS_STORE) || (a >= 0x151D60 && a < 0x151F00 && (wop.flags & IS_MEMORY)))
 			return a == pc ? 1 : 2;
 	}
