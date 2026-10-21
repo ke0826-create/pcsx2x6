@@ -8,6 +8,7 @@
 
 #include "Common.h"
 #include "Memory.h"
+#include "GS.h"
 #include "R3000A.h"
 #include "Sif.h"
 #include "Config.h"
@@ -1686,6 +1687,8 @@ namespace Rollback
 			bool sif_replaying = false;
 			// EE write watch (see Rollback.h)
 			std::vector<std::pair<u32, u32>> watch_ranges;
+			Common::Timer resim_timer;
+			double ms_resim = 0.0;
 			u32 prof_save = 0, prof_load = 0; // debug bit 15: the per-phase timings of the first snapshot saves/restores go to the log
 			u32 voice_limit = 0; // debug bit 4096: frames after which the operator voice (channel 3) is treated as finished; 0 = off
 			u32 voice_cuts = 0;
@@ -2267,6 +2270,9 @@ namespace Rollback
 								"stalls %u (%.0f ms), snapshots %u, restore %.1f ms total, save %.1f ms total, packets in %u (bad %u) out %u (dropped %u), BF anomalies %u",
 					tag, live_frames, rollbacks, resim_frames, max_depth, pred_ok, pred_bad, stalls, ms_stall, saves, ms_restore, ms_save, pkts_in, pkts_bad, pkts_out,
 					pkts_dropped, anomalies);
+				if (resim_frames)
+					Console.WriteLn("RbNet: re-simulation: %u frames in %.1f ms = %.2f ms per frame%s", resim_frames, ms_resim, ms_resim / resim_frames,
+						(cfg.debug & 32768) ? " (no drawing)" : "");
 				if (voice_limit)
 					Console.WriteLn("RbNet: operator window: channel released %u times (limit %u frames)", voice_cuts, voice_limit);
 				if (sif_logged_w || sif_logged_i)
@@ -2293,6 +2299,8 @@ namespace Rollback
 				if (resim && VMManager::HasValidVM())
 					VMManager::SetLimiterMode(s_prev_limiter);
 				resim = false;
+				if (cfg.debug & 32768)
+					GSSetRollbackSkip(false);
 				Rollback::g_sif1_drop = false;
 				WatchStop();
 				if (FastTrack_Active())
@@ -2618,6 +2626,9 @@ namespace Rollback
 						return;
 					}
 					resim = false; // back at the frame where the rollback was requested: this is a live hook again
+					ms_resim += resim_timer.GetTimeMilliseconds();
+					if (cfg.debug & 32768)
+						GSSetRollbackSkip(false);
 					Rollback::g_sif1_drop = false;
 					SifApplyUpTo(0xFFFFFFFFu);
 					VMManager::SetLimiterMode(s_prev_limiter);
@@ -2806,7 +2817,7 @@ namespace Rollback
 						pkts_in = pkts_bad = live_frames = pkts_out = pkts_dropped = 0;
 						outq.clear();
 						rng = 12345u + me * 7919u;
-						ms_restore = ms_save = ms_stall = 0.0;
+						ms_restore = ms_save = ms_stall = ms_resim = 0.0;
 						last_logged = kNoFrame;
 						resim = false;
 						for (sess::Slot& s : ring)
@@ -3000,6 +3011,9 @@ namespace Rollback
 						ms_restore += t.GetTimeMilliseconds();
 						expect = s.frame + 1;
 						resim = true;
+						resim_timer.Reset();
+						if (cfg.debug & 32768)
+							GSSetRollbackSkip(true); // no drawing/presenting while the frames are re-simulated
 						Rollback::g_sif1_drop = (cfg.debug & 2048) != 0;
 						VMManager::SetLimiterMode(LimiterModeType::Unlimited);
 						WriteAll(s.frame); // the word of the snapshot's own frame, now with the corrected input

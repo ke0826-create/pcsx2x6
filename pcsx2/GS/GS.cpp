@@ -457,6 +457,13 @@ void GSgifTransfer3(u8* mem, u32 size)
 	g_gs_renderer->Transfer<2>(const_cast<u8*>(mem), size);
 }
 
+bool g_gs_rollback_skip = false;
+
+void GSSetRollbackSkip(bool on)
+{
+	MTGS::RunOnGSThread([on]() { g_gs_rollback_skip = on; });
+}
+
 void GSvsync(u32 field, bool registers_written)
 {
 	// Update this here because we need to check if the pending draw affects the current frame, so our regs need to be updated.

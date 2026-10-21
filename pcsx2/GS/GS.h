@@ -71,6 +71,10 @@ void GSgifTransfer1(u8* mem, u32 addr);
 void GSgifTransfer2(u8* mem, u32 size);
 void GSgifTransfer3(u8* mem, u32 size);
 void GSvsync(u32 field, bool registers_written);
+// Rollback: while on, the GS thread does not draw and does not merge/present (registers, transfers and events go on).
+// The change is queued in the GS command stream, so it takes effect exactly between the frames around it.
+extern bool g_gs_rollback_skip;
+void GSSetRollbackSkip(bool on);
 int GSfreeze(FreezeAction mode, freezeData* data);
 std::string GSGetBaseSnapshotFilename();
 std::string GSGetBaseVideoFilename();

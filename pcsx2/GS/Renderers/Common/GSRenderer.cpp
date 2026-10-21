@@ -604,6 +604,15 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
 		}
 	}
 
+	if (g_gs_rollback_skip)
+	{
+		// the frames of a rollback re-simulation: nothing to merge or show
+		m_last_draw_n = s_n;
+		m_last_transfer_n = s_transfer_n;
+		g_perfmon.EndFrame(idle_frame);
+		return;
+	}
+
 	const int fb_sprite_blits = g_perfmon.GetDisplayFramebufferSpriteBlits();
 	const bool fb_sprite_frame = (fb_sprite_blits > 0);
 
