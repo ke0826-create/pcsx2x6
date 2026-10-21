@@ -83,6 +83,11 @@ struct FastSnapshot
 	std::vector<u8> internals;          // BIOS tag + FreezeInternals (memSavingState format)
 	std::vector<FastRegion> ee_regions; // set by the caller; empty = the first 32 MB
 	std::vector<u8> ee;                 // the regions' bytes, back to back
+	// With FastTrack (see vtlb.h) active at the save, the first 32 MB are not in `ee`: only the pages that were hot at that time.
+	bool tracked = false;
+	u32 track_epoch = 0;
+	u32 hot_n = 0;                      // number of pages in ee_hot = the first hot_n of FastTrack_HotList()
+	std::vector<u8> ee_hot;
 	std::vector<u8> other;              // IOP RAM, HW registers, scratchpad, VU memories, SPU2 (fixed order)
 };
 

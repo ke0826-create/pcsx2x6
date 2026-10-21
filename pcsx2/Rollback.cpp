@@ -2294,6 +2294,16 @@ namespace Rollback
 				resim = false;
 				Rollback::g_sif1_drop = false;
 				WatchStop();
+				if (FastTrack_Active())
+				{
+					u32 bad_page = 0;
+					const u32 bad = FastTrack_Verify(&bad_page);
+					Console.WriteLn("RbNet: write tracking: %u pages hot (%u promotions); %u cold pages differ from the baseline%s", FastTrack_HotCount(), FastTrack_Promotions(),
+						bad, bad ? " <-- a write got past the protection" : "");
+					if (bad)
+						Console.WriteLn("RbNet: first cold page that changed: 0x%X", bad_page << 12);
+					FastTrack_End();
+				}
 				LogStats(why);
 				RollbackNet::Close();
 				outq.clear();
@@ -2822,6 +2832,14 @@ namespace Rollback
 						WriteAll(F);
 						if (!(cfg.debug & 1))
 						{
+							if (cfg.debug & 8192)
+							{
+								// snapshots of only the pages written since now (see vtlb.h, FastTrack)
+								if (FastTrack_Begin())
+									Console.WriteLn("RbNet: EE RAM write tracking on (snapshots copy only the pages written since now)");
+								else
+									Console.Error("RbNet: EE RAM write tracking could not start");
+							}
 							ring[0].snap.ee_regions = s_regions;
 							if (!SaveState_FastSave(ring[0].snap, false, &error))
 							{

@@ -232,6 +232,21 @@ extern vtlb_ProtectionMode mmap_GetRamPageInfo(u32 paddr);
 extern void mmap_MarkCountedRamPage(u32 paddr);
 extern void mmap_ResetBlockTracking();
 
+// Rollback: write tracking of the first 32 MB of EE RAM for cheap snapshots (see vtlb.cpp and SaveState.cpp).
+// After FastTrack_Begin() every page is write protected ("cold"); the first write to a page (the page fault handler)
+// promotes it to "hot" and unprotects it. A snapshot then only has to copy the hot pages; the cold ones are known to
+// still hold the baseline taken at Begin.
+extern bool FastTrack_Begin();
+extern void FastTrack_End();
+extern void FastTrack_Reprotect(); // after mmap_ResetBlockTracking(): protect the cold pages again
+extern bool FastTrack_Active();
+extern u32 FastTrack_Epoch();
+extern u32 FastTrack_HotCount();
+extern const u32* FastTrack_HotList(); // the hot pages in the order they were promoted
+extern const u8* FastTrack_Base();     // the baseline image (first 32 MB)
+extern u32 FastTrack_Promotions();
+extern u32 FastTrack_Verify(u32* first_bad_page); // number of cold pages that differ from the baseline (should be 0)
+
 // --------------------------------------------------------------------------------------
 //  Goemon game fix
 // --------------------------------------------------------------------------------------

@@ -12,6 +12,8 @@
 #include "DebugTools/SymbolImporter.h"
 #include "Elfheader.h"
 #include "GS.h"
+#include <algorithm>
+#include "vtlb.h"
 #include "GS/GS.h"
 #include "Host.h"
 #include "MTGS.h"
@@ -1384,7 +1386,24 @@ bool SaveState_FastSave(FastSnapshot& snap, bool log, Error* error)
 	s_freeze_prof = nullptr;
 	prof.Lap("FreezeBios+Internals");
 
-	const std::vector<FastRegion> regions = FastEffectiveRegions(snap);
+	std::vector<FastRegion> regions = FastEffectiveRegions(snap);
+	snap.tracked = FastTrack_Active();
+	if (snap.tracked)
+	{
+		// only the pages written since the tracking began; the first 32 MB are otherwise the baseline
+		snap.track_epoch = FastTrack_Epoch();
+		snap.hot_n = FastTrack_HotCount();
+		const u32* hot = FastTrack_HotList();
+		snap.ee_hot.resize(static_cast<size_t>(snap.hot_n) * 4096);
+		for (u32 i = 0; i < snap.hot_n; i++)
+			std::memcpy(snap.ee_hot.data() + static_cast<size_t>(i) * 4096, eeMem->Main + (static_cast<size_t>(hot[i]) << 12), 4096);
+		regions.erase(std::remove_if(regions.begin(), regions.end(), [](const FastRegion& r) { return r.offset < 32u * 1024u * 1024u; }), regions.end());
+	}
+	else
+	{
+		snap.hot_n = 0;
+		snap.ee_hot.clear();
+	}
 	size_t total = 0;
 	for (const FastRegion& r : regions)
 		total += r.size;
@@ -1440,9 +1459,32 @@ bool SaveState_FastLoad(const FastSnapshot& snap, FastLoadMode mode, bool log, u
 	s_freeze_prof = nullptr;
 	prof.Lap("FreezeBios+Internals");
 
-	const std::vector<FastRegion> regions = FastEffectiveRegions(snap);
+	std::vector<FastRegion> regions = FastEffectiveRegions(snap);
 	size_t pos = 0;
 	u32 restored = 0;
+	if (snap.tracked)
+	{
+		if (!FastTrack_Active() || snap.track_epoch != FastTrack_Epoch())
+		{
+			Error::SetString(error, "the snapshot belongs to an earlier write tracking");
+			return false;
+		}
+		// the pages hot at the save from the snapshot, the ones promoted since (still baseline at the save) from the baseline
+		const u32 hn = FastTrack_HotCount();
+		const u32* hot = FastTrack_HotList();
+		const u8* base = FastTrack_Base();
+		for (u32 i = 0; i < hn; i++)
+		{
+			u8* dst = eeMem->Main + (static_cast<size_t>(hot[i]) << 12);
+			const u8* src = (i < snap.hot_n) ? snap.ee_hot.data() + static_cast<size_t>(i) * 4096 : base + (static_cast<size_t>(hot[i]) << 12);
+			if (std::memcmp(dst, src, 4096) != 0)
+			{
+				std::memcpy(dst, src, 4096);
+				restored++;
+			}
+		}
+		regions.erase(std::remove_if(regions.begin(), regions.end(), [](const FastRegion& r) { return r.offset < 32u * 1024u * 1024u; }), regions.end());
+	}
 	for (const FastRegion& r : regions)
 	{
 		u8* dst = eeMem->Main + r.offset;

@@ -34,6 +34,7 @@
 
 #include <bit>
 #include <map>
+#include <mutex>
 #include <unordered_set>
 #include <unordered_map>
 
@@ -1497,6 +1498,129 @@ static __fi void mmap_ClearCpuBlock(uint offset)
 	Cpu->Clear(m_PageProtectInfo[rampage].ReverseRamMap, __pagesize);
 }
 
+
+// --------------------------------------------------------------------------------------
+//  Rollback write tracking (FastTrack)
+// --------------------------------------------------------------------------------------
+namespace
+{
+	constexpr u32 kTrackBytes = 32u * 1024u * 1024u;
+	constexpr u32 kTrackPages = kTrackBytes >> __pageshift;
+
+	std::mutex s_track_mtx;
+	bool s_track_active = false;
+	u32 s_track_epoch = 0;
+	u32 s_track_promotions = 0;
+	std::vector<u8> s_track_base; // baseline bytes of the first 32 MB
+	std::vector<u8> s_track_cold; // 1 = still protected and never written since Begin
+	std::vector<u32> s_track_hot; // promoted pages, in promotion order
+
+	void TrackProtect(u32 first_page, u32 pages, PageProtectionMode prot)
+	{
+		HostSys::MemProtect(&eeMem->Main[first_page << __pageshift], static_cast<size_t>(pages) << __pageshift, prot);
+		vtlb_UpdateFastmemProtection(first_page << __pageshift, pages << __pageshift, prot);
+	}
+
+	// The page fault handler calls this for a fault inside the first 32 MB of EE RAM. true = the page was cold and is hot now.
+	bool TrackOnWrite(u32 page)
+	{
+		if (!s_track_active || page >= kTrackPages)
+			return false;
+		std::lock_guard<std::mutex> lk(s_track_mtx);
+		if (!s_track_cold[page])
+			return false;
+		s_track_cold[page] = 0;
+		s_track_hot.push_back(page);
+		s_track_promotions++;
+		if (m_PageProtectInfo[page].Mode != ProtMode_Write)
+			TrackProtect(page, 1, PageAccess_ReadWrite());
+		// ProtMode_Write: the caller goes on with the normal handling, which clears the recompiled blocks and unprotects
+		return true;
+	}
+} // namespace
+
+bool FastTrack_Begin()
+{
+	std::lock_guard<std::mutex> lk(s_track_mtx);
+	if (!eeMem)
+		return false;
+	s_track_base.assign(eeMem->Main, eeMem->Main + kTrackBytes);
+	s_track_cold.assign(kTrackPages, 1);
+	s_track_hot.clear();
+	s_track_hot.reserve(4096);
+	s_track_promotions = 0;
+	s_track_epoch++;
+	s_track_active = true;
+	TrackProtect(0, kTrackPages, PageAccess_ReadOnly());
+	return true;
+}
+
+void FastTrack_End()
+{
+	std::lock_guard<std::mutex> lk(s_track_mtx);
+	if (!s_track_active || !eeMem)
+	{
+		s_track_active = false;
+		return;
+	}
+	s_track_active = false;
+	// back to what the recompiler wants: read/write everywhere except the pages it protects itself
+	TrackProtect(0, kTrackPages, PageAccess_ReadWrite());
+	for (u32 p = 0; p < kTrackPages; p++)
+	{
+		if (m_PageProtectInfo[p].Mode == ProtMode_Write)
+			TrackProtect(p, 1, PageAccess_ReadOnly());
+	}
+}
+
+void FastTrack_Reprotect()
+{
+	std::lock_guard<std::mutex> lk(s_track_mtx);
+	if (!s_track_active || !eeMem)
+		return;
+	for (u32 p = 0; p < kTrackPages;)
+	{
+		if (!s_track_cold[p])
+		{
+			p++;
+			continue;
+		}
+		u32 q = p;
+		while (q < kTrackPages && s_track_cold[q])
+			q++;
+		TrackProtect(p, q - p, PageAccess_ReadOnly());
+		p = q;
+	}
+}
+
+bool FastTrack_Active() { return s_track_active; }
+u32 FastTrack_Epoch() { return s_track_epoch; }
+u32 FastTrack_HotCount() { return static_cast<u32>(s_track_hot.size()); }
+const u32* FastTrack_HotList() { return s_track_hot.data(); }
+const u8* FastTrack_Base() { return s_track_base.data(); }
+u32 FastTrack_Promotions() { return s_track_promotions; }
+
+u32 FastTrack_Verify(u32* first_bad_page)
+{
+	if (!s_track_active || !eeMem)
+		return 0;
+	u32 bad = 0;
+	if (first_bad_page)
+		*first_bad_page = 0xFFFFFFFFu;
+	for (u32 p = 0; p < kTrackPages; p++)
+	{
+		if (!s_track_cold[p])
+			continue;
+		if (std::memcmp(eeMem->Main + (static_cast<size_t>(p) << __pageshift), s_track_base.data() + (static_cast<size_t>(p) << __pageshift), __pagesize) != 0)
+		{
+			if (!bad && first_bad_page)
+				*first_bad_page = p;
+			bad++;
+		}
+	}
+	return bad;
+}
+
 PageFaultHandler::HandlerResult PageFaultHandler::HandlePageFault(void* exception_pc, void* fault_address, bool is_write)
 {
 	pxAssert(eeMem);
@@ -1509,6 +1633,9 @@ PageFaultHandler::HandlerResult PageFaultHandler::HandlePageFault(void* exceptio
 
 		uptr ptr = (uptr)PSM(vaddr);
 		uptr offset = (ptr - (uptr)eeMem->Main);
+		if (ptr && offset < kTrackBytes && TrackOnWrite(static_cast<u32>(offset >> __pageshift)) &&
+			m_PageProtectInfo[offset >> __pageshift].Mode != ProtMode_Write)
+			return HandlerResult::ContinueExecution; // a cold page became hot
 		if (ptr && m_PageProtectInfo[offset >> __pageshift].Mode == ProtMode_Write)
 		{
 			// fprintf(stderr, "Not backpatching code write at %08X\n", vaddr);
@@ -1531,6 +1658,10 @@ PageFaultHandler::HandlerResult PageFaultHandler::HandlePageFault(void* exceptio
 		if (offset >= Ps2MemSize::ExposedRam)
 			return HandlerResult::ExecuteNextHandler;
 
+		if (offset < kTrackBytes && TrackOnWrite(static_cast<u32>(offset >> __pageshift)) &&
+			m_PageProtectInfo[offset >> __pageshift].Mode != ProtMode_Write)
+			return HandlerResult::ContinueExecution; // a cold page became hot
+
 		mmap_ClearCpuBlock(offset);
 		return HandlerResult::ContinueExecution;
 	}
@@ -1547,4 +1678,5 @@ void mmap_ResetBlockTracking()
 	if (eeMem)
 		HostSys::MemProtect(eeMem->Main, Ps2MemSize::ExposedRam, PageAccess_ReadWrite());
 	vtlb_UpdateFastmemProtection(0, Ps2MemSize::ExposedRam, PageAccess_ReadWrite());
+	FastTrack_Reprotect();
 }
