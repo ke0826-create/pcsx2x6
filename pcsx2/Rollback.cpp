@@ -1686,6 +1686,7 @@ namespace Rollback
 			bool sif_replaying = false;
 			// EE write watch (see Rollback.h)
 			std::vector<std::pair<u32, u32>> watch_ranges;
+			u32 prof_save = 0, prof_load = 0; // debug bit 15: the per-phase timings of the first snapshot saves/restores go to the log
 			u32 voice_limit = 0; // debug bit 4096: frames after which the operator voice (channel 3) is treated as finished; 0 = off
 			u32 voice_cuts = 0;
 			std::vector<std::pair<u32, u32>> user_keep; // rb_keep.txt: EE RAM ranges ("<lo> <hi>" hex) that a restore leaves as they are
@@ -2860,7 +2861,7 @@ namespace Rollback
 					{
 						sess::Slot& s = ring[save_slot];
 						s.snap.ee_regions = s_regions;
-						if (!SaveState_FastSave(s.snap, false, &error))
+						if (!SaveState_FastSave(s.snap, (cfg.debug & 16384) && (++prof_save % 300) == 0 && prof_save <= 1200, &error))
 						{
 							Console.Error("RbNet: snapshot save failed: %s", error.GetDescription().c_str());
 							Stop("save failed");
@@ -2927,7 +2928,7 @@ namespace Rollback
 							for (const KeepRange& r : kKeep)
 								keep.insert(keep.end(), eeMem->Main + r.lo, eeMem->Main + r.hi);
 						}
-						if (!SaveState_FastLoad(s.snap, FastLoadMode::Diff, false, nullptr, &error))
+						if (!SaveState_FastLoad(s.snap, FastLoadMode::Diff, (cfg.debug & 16384) && (++prof_load % 4) == 0 && prof_load <= 16, nullptr, &error))
 						{
 							Console.Error("RbNet: restore failed: %s", error.GetDescription().c_str());
 							Stop("restore failed");
