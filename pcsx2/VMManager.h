@@ -326,6 +326,9 @@ namespace VMManager
 		/// Throttles execution, or limits the frame rate.
 		void Throttle();
 
+		/// Waits part of the frame's spare time before input is polled, to cut input latency.
+		void FrameDelay();
+
 		/// Resets/clears all execution/code caches.
 		void ClearCPUExecutionCaches();
 

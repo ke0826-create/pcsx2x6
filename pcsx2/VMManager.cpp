@@ -63,6 +63,7 @@
 #include "fmt/format.h"
 
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <sstream>
@@ -206,6 +207,13 @@ static float s_target_speed = 0.0f;
 static bool s_target_speed_can_sync_to_host = false;
 static bool s_target_speed_synced_to_host = false;
 static bool s_use_vsync_for_timing = false;
+
+// Frame delay: how long the CPU thread worked in each of the last frames (from the end of the delay to the throttle).
+static constexpr u32 FRAME_DELAY_HISTORY = 60;
+static u64 s_frame_work_start = 0;
+static s64 s_frame_work_ticks[FRAME_DELAY_HISTORY] = {};
+static u32 s_frame_work_pos = 0;
+static u32 s_frame_work_count = 0;
 
 // Used to track play time. We use a monotonic timer here, in case of clock changes.
 static u64 s_session_resume_timestamp = 0;
@@ -2467,12 +2475,22 @@ float VMManager::GetFrameRate()
 void VMManager::ResetFrameLimiter()
 {
 	s_limiter_frame_start = GetCPUTicks();
+	s_frame_work_start = 0;
+	s_frame_work_count = 0;
 }
 
 void VMManager::Internal::Throttle()
 {
 	if (s_target_speed == 0.0f || s_use_vsync_for_timing)
 		return;
+
+	if (s_frame_work_start != 0)
+	{
+		s_frame_work_ticks[s_frame_work_pos] = static_cast<s64>(GetCPUTicks() - s_frame_work_start);
+		s_frame_work_pos = (s_frame_work_pos + 1) % FRAME_DELAY_HISTORY;
+		s_frame_work_count = std::min(s_frame_work_count + 1, FRAME_DELAY_HISTORY);
+		s_frame_work_start = 0;
+	}
 
 	const u64 uExpectedEnd =
 		s_limiter_frame_start +
@@ -2507,6 +2525,40 @@ void VMManager::Internal::Throttle()
 
 	// Finally, set our next frame start to when this one ends
 	s_limiter_frame_start = uExpectedEnd;
+}
+
+void VMManager::Internal::FrameDelay()
+{
+	const u32 delay_ms = EmuConfig.EmulationSpeed.FrameDelayMS;
+	if (delay_ms == 0 || s_limiter_mode != LimiterModeType::Nominal || s_target_speed == 0.0f || s_use_vsync_for_timing)
+	{
+		s_frame_work_start = 0;
+		s_frame_work_count = 0;
+		return;
+	}
+
+	// Only delay once a full history of frame times is known, and never past what the slowest recent
+	// frame (plus the GS wait already spent in this frame and a 2ms margin) leaves free.
+	if (s_frame_work_count >= FRAME_DELAY_HISTORY)
+	{
+		const s64 freq = static_cast<s64>(GetTickFrequency());
+		const s64 worst = *std::max_element(std::begin(s_frame_work_ticks), std::end(s_frame_work_ticks));
+		const u64 now = GetCPUTicks();
+		const s64 elapsed = static_cast<s64>(now - s_limiter_frame_start);
+		const s64 delay = std::min(freq * delay_ms / 1000, s_limiter_ticks_per_frame - elapsed - worst - freq * 2 / 1000);
+		if (delay > 0)
+		{
+			const u64 end = now + static_cast<u64>(delay);
+			const s32 msec = static_cast<s32>(delay * 1000 / freq);
+			if (msec > 1)
+				Threading::Sleep(msec - 1);
+			while (GetCPUTicks() < end)
+			{
+			}
+		}
+	}
+
+	s_frame_work_start = GetCPUTicks();
 }
 
 void VMManager::Internal::FrameRateChanged()

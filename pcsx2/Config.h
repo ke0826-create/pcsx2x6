@@ -850,7 +850,7 @@ struct Pcsx2Config
 			};
 		};
 
-		int VsyncQueueSize = 2;
+		int VsyncQueueSize = 0;
 
 		float FramerateNTSC = DEFAULT_FRAME_RATE_NTSC;
 		float FrameratePAL = DEFAULT_FRAME_RATE_PAL;
@@ -1212,6 +1212,10 @@ struct Pcsx2Config
 		float NominalScalar{1.0f};
 		float TurboScalar{2.0f};
 		float SlomoScalar{0.5f};
+
+		// Milliseconds to wait after presenting before polling input and emulating the next frame.
+		// Shrinks automatically when the measured frame time leaves no room (0 = off).
+		uint FrameDelayMS{8};
 
 		EmulationSpeedOptions();
 

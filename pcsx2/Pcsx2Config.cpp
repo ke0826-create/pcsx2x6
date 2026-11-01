@@ -1750,6 +1750,7 @@ void Pcsx2Config::EmulationSpeedOptions::SanityCheck()
 	NominalScalar = std::clamp(NominalScalar, 0.05f, 10.0f);
 	TurboScalar = std::clamp(TurboScalar, 0.05f, 10.0f);
 	SlomoScalar = std::clamp(SlomoScalar, 0.05f, 10.0f);
+	FrameDelayMS = std::min(FrameDelayMS, 14u);
 }
 
 void Pcsx2Config::EmulationSpeedOptions::LoadSave(SettingsWrapper& wrap)
@@ -1759,6 +1760,7 @@ void Pcsx2Config::EmulationSpeedOptions::LoadSave(SettingsWrapper& wrap)
 	SettingsWrapEntry(NominalScalar);
 	SettingsWrapEntry(TurboScalar);
 	SettingsWrapEntry(SlomoScalar);
+	SettingsWrapEntry(FrameDelayMS);
 
 	// This was in the wrong place... but we can't change it without breaking existing configs.
 	//SettingsWrapBitBool(SyncToHostRefreshRate);
@@ -1768,7 +1770,7 @@ void Pcsx2Config::EmulationSpeedOptions::LoadSave(SettingsWrapper& wrap)
 
 bool Pcsx2Config::EmulationSpeedOptions::operator==(const EmulationSpeedOptions& right) const
 {
-	return OpEqu(bitset) && OpEqu(NominalScalar) && OpEqu(TurboScalar) && OpEqu(SlomoScalar);
+	return OpEqu(bitset) && OpEqu(NominalScalar) && OpEqu(TurboScalar) && OpEqu(SlomoScalar) && OpEqu(FrameDelayMS);
 }
 
 bool Pcsx2Config::EmulationSpeedOptions::operator!=(const EmulationSpeedOptions& right) const

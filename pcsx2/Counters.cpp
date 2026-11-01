@@ -498,6 +498,10 @@ static __fi void VSyncStart(u64 sCycle)
 
 	gsPostVsyncStart(); // MUST be after framelimit; doing so before causes funk with frame times!
 
+	// Frame delay: spend some of the idle time now, so the input polled below is fresher when the frame is shown.
+	if (!VMManager::Internal::IsExecutionInterrupted())
+		VMManager::Internal::FrameDelay();
+
 	// Poll input after MTGS frame push, just in case it has to stall to catch up.
 	VMManager::Internal::PollInputOnCPUThread();
 
